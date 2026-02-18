@@ -68,8 +68,7 @@ or the [ML-Agents github repository](https://github.com/Unity-Technologies/ml-ag
    [official PyTorch website](https://pytorch.org/get-started/locally/). 
    If you have GPU in your device, select the "Compute Platform" according to your CUDA version (can be verified for 
    example by typing `nvidia-smi` into your command line).
-4. Create a local clone of the ml-agents repository (`clone ml-agents repo: git clone --branch 
-   release_22 https://github.com/Unity-Technologies/ml-agents.git`)
+4. Create a local clone of the ml-agents repository (`clone ml-agents repo: git clone --branch release_23 https://github.com/Unity-Technologies/ml-agents.git`)
 5. Go to the cloned directory (`cd /path/to/ml-agents `)
 6. Install ml-agents-envs into your conda environment (`python -m pip install ./ml-agents-envs `)
 7. Install the ml-agents (`python -m pip install ./ml-agents`)
@@ -84,16 +83,17 @@ setup, activate the installed conda environment in command line. The training is
 ### Running on linux servers
 There are several things not to forget when training using linux servers.
 1) Set up the conda environment exactly as described above, with an exception in step 3: make sure that you have 
-   installed pytorch with the correct CUDA version (e.g. on uran it is CUDA 12.8).
-2) You do not need to have a copy of this repository on the server (if possible, avoid it).
-3) After setting up the Unity environment on your PC, go to `File -> Build Profiles -> Linux Server`. You might have to 
+   installed torch (version <= 2.8.0) with the correct CUDA version (on uran, neptun & jupiter torch 2.8.0 is tested and
+   works with it is CUDA 12.8, 12.9 and 12.9, respectively).
+3) You do not need to have a copy of this repository on the server (if possible, avoid it).
+4) After setting up the Unity environment on your PC, go to `File -> Build Profiles -> Linux Server`. You might have to 
    install Linux Server in Unity, re-open the project and switch to Linux Server Platform. After doing so, make sure, 
    that in the `Scene List`, only the intended scene is selected. Then build the project into a folder. 
-4) In the same folder (which contains the folder with the build), copy your `configuration.yaml` containing training 
+5) In the same folder (which contains the folder with the build), copy your `configuration.yaml` containing training 
    parameters.
-5) Copy this folder into the linux server, and you are ready to train. Go to this folder on the server, activate 
+6) Copy this folder into the linux server, and you are ready to train. Go to this folder on the server, activate 
    installed conda environment and train (`mlagents-learn name_of_config_file.yaml --env=name_of_the_built_env_folder/file_with.x86_64_but_without.x86_64 --run-id=id_of_this_run`).
-6) You might need to change the read, write and execute permissions for the built project 
+7) You might need to change the read, write and execute permissions for the built project 
    (`chmod -R 755 path_to_build/nico_bld.x86_64`). When running the training without having this step, the code might 
    crash with a general broken pipeline error.
    

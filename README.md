@@ -106,4 +106,5 @@ Notes:
    - This headless training can also be tested on your local machine. (for windows: use Windows Server in Unity; also 
      building in windows generates a different hierarchy of files/folders. Thus, make sure you specify the path during 
      training properly).
-   - After training, you can move the trained mode and log files to you local machine.  
+   - After training, you can move the trained mode and log files to you local machine.
+   - While the models are relatively small (as in the number of parameters), the RL training can leverage much more CPU than GPU. Therefore, a clean "CPU only" run can be achieved using "CUDA_VISIBLE_DEVICES=-1 mlagents-learn ..."

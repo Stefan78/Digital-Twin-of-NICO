@@ -1,16 +1,14 @@
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
 using Unity.MLAgents.Sensors;
-using System.Linq;
-using System;
 using Random = UnityEngine.Random;
 
-
 public class NicoAgentReach : Agent
-{   
-    ArticulationBody nico_art_body;
+{
+    private ArticulationBody nico_art_body;
 
     [Header("NICO parts to control")]
     [SerializeField] private bool useLeftHand = true;
@@ -22,23 +20,40 @@ public class NicoAgentReach : Agent
     public List<ArticulationBody> rightHandJoints = new List<ArticulationBody>();
     public List<ArticulationBody> headJoints = new List<ArticulationBody>();
 
-    private List<ArticulationBody> activeJoints;
+    private List<ArticulationBody> activeJoints = new List<ArticulationBody>();
 
-    private Dictionary<ArticulationBody, float> defaultJointTargets = new Dictionary<ArticulationBody, float>();
-    private Dictionary<ArticulationBody, float> currentJointChanges = new Dictionary<ArticulationBody, float>();
+    private readonly Dictionary<ArticulationBody, float> defaultJointTargets =
+        new Dictionary<ArticulationBody, float>();
+    private readonly Dictionary<ArticulationBody, float> currentJointChanges =
+        new Dictionary<ArticulationBody, float>();
+    private readonly Dictionary<ArticulationBody, ArticulationBody[]> fingerChains =
+        new Dictionary<ArticulationBody, ArticulationBody[]>();
 
-    private Dictionary<ArticulationBody, ArticulationBody[]> fingerChains = new Dictionary<ArticulationBody, ArticulationBody[]>();
+    [Header("Curriculum Target Cubes")]
+    [Tooltip("Place the target cubes in the scene at the desired world positions. The first N cubes are enabled by the curriculum.")]
+    [SerializeField] private List<GameObject> targetCubes = new List<GameObject>();
 
-    [Tooltip("The target object")]
+    [Tooltip("Current goal cube. Assigned automatically from Target Cubes each episode. If Target Cubes is empty, this object is used as a fallback.")]
     public GameObject target;
 
-    [Tooltip("End effector")]
+    [Tooltip("End effector for the right hand")]
     public GameObject effector_1;
 
-    [Tooltip("End effector")]
+    [Tooltip("End effector for the left hand")]
     public GameObject effector_2;
 
-    // added START
+    [SerializeField, Min(1)] private int initialTargetsUnlocked = 1;
+    [SerializeField, Min(1)] private int successWindowSize = 50;
+    [SerializeField, Range(0f, 1f)] private float successRateToUnlockNextTarget = 0.8f;
+
+    private int unlockedTargetCount;
+    private readonly Queue<bool> recentEpisodeResults = new Queue<bool>();
+
+    [Header("Episode Length")]
+    [Tooltip("Maximum number of agent decisions in one episode. A timeout counts as a failed reaching episode.")]
+    [SerializeField, Min(1)] private int maxEpisodeSteps = 1000;
+    private int episodeSteps;
+
     [Header("Reach Reward Settings")]
     [SerializeField] private float reachDistance = 0.05f;
     [SerializeField] private float progressWeight = 3f;
@@ -48,55 +63,49 @@ public class NicoAgentReach : Agent
     [SerializeField] private float movementWeight = 0.005f;
 
     [Header("Stall Detection")]
-    [SerializeField] private int noProgressStepsToLock = 100;
-    [SerializeField] private float noProgressEpsilon = 0.001f;
+    [SerializeField, Min(1)] private int noProgressStepsToLock = 100;
+    [SerializeField, Min(0f)] private float noProgressEpsilon = 0.001f;
 
     private bool rightHandLocked;
     private bool leftHandLocked;
+    private bool rightHandReached;
+    private bool leftHandReached;
 
     private float previousRightDistance;
     private float previousLeftDistance;
-
     private float bestRightDistance;
     private float bestLeftDistance;
-
     private int rightNoProgressSteps;
     private int leftNoProgressSteps;
-    // added END
-
 
     private void CacheFingerChain(ArticulationBody root)
     {
-        if (root == null) return;
-        var joints = root.GetComponentsInChildren<ArticulationBody>();
+        if (root == null)
+            return;
+
+        ArticulationBody[] joints = root.GetComponentsInChildren<ArticulationBody>();
         fingerChains[root] = joints.Where(j => j != root).ToArray();
     }
 
-
     private void CollectJointsInformation(ArticulationBody root)
     {
-        foreach (var joint in root.GetComponentsInChildren<ArticulationBody>())
+        foreach (ArticulationBody joint in root.GetComponentsInChildren<ArticulationBody>())
         {
-            string joint_name = joint.name.ToLower();
-            string joint_tag = joint.tag.ToLower();
+            string jointName = joint.name.ToLowerInvariant();
+            string jointTag = joint.tag.ToLowerInvariant();
 
-            // caching the basis of the fingers to be later used for movements of all joints in the finger with one parameter
-            if (joint_tag.Contains("base"))
-            {
+            // Cache finger bases so one action can also drive their child joints.
+            if (jointTag.Contains("base"))
                 CacheFingerChain(joint);
-            }
 
-            if (joint_name.StartsWith("l_") && !joint_tag.Contains("continuation"))
+            if (jointName.StartsWith("l_") && !jointTag.Contains("continuation"))
                 leftHandJoints.Add(joint);
-
-            else if (joint_name.StartsWith("r_") && !joint_tag.Contains("continuation"))
+            else if (jointName.StartsWith("r_") && !jointTag.Contains("continuation"))
                 rightHandJoints.Add(joint);
-
-            else if (joint_name.StartsWith("h_"))
+            else if (jointName.StartsWith("h_"))
                 headJoints.Add(joint);
         }
     }
-
 
     private void UpdateActiveJoints()
     {
@@ -112,93 +121,123 @@ public class NicoAgentReach : Agent
             activeJoints.AddRange(headJoints);
     }
 
-
     public override void Initialize()
     {
         base.Initialize();
 
         nico_art_body = GetComponent<ArticulationBody>();
+        if (nico_art_body == null)
+        {
+            Debug.LogError("NicoAgentReach requires an ArticulationBody on the same GameObject as the Agent.");
+            enabled = false;
+            return;
+        }
+
+        // Clean up empty or duplicate Inspector references.
+        targetCubes = targetCubes.Where(cube => cube != null).Distinct().ToList();
+
+        // Backwards compatibility: if no list was assigned, use the original Target object.
+        if (targetCubes.Count == 0 && target != null)
+            targetCubes.Add(target);
+
+        if (targetCubes.Count == 0)
+        {
+            Debug.LogError("NicoAgentReach: assign at least one cube to Target Cubes (or assign Target as a fallback).");
+            enabled = false;
+            return;
+        }
+
+        if (effector_1 == null || effector_2 == null)
+        {
+            Debug.LogError("NicoAgentReach: assign both end effectors (effector_1 and effector_2) in the Inspector.");
+            enabled = false;
+            return;
+        }
+
+        unlockedTargetCount = Mathf.Clamp(initialTargetsUnlocked, 1, targetCubes.Count);
+        UpdateTargetCubeVisibility();
+        target = targetCubes[0];
 
         CollectJointsInformation(nico_art_body);
         UpdateActiveJoints();
 
-        foreach (var joint in activeJoints)
+        foreach (ArticulationBody joint in activeJoints)
         {
             defaultJointTargets[joint] = joint.xDrive.target;
             currentJointChanges[joint] = 0f;
         }
     }
 
+    private void UpdateTargetCubeVisibility()
+    {
+        // Stage 1 exposes one target. Later stages enable the first 2, 3, ... targets.
+        for (int i = 0; i < targetCubes.Count; i++)
+        {
+            if (targetCubes[i] != null)
+                targetCubes[i].SetActive(i < unlockedTargetCount);
+        }
+    }
 
     public void SetJointTarget(ArticulationBody joint, float angle)
     {
-        var drive = joint.xDrive;
+        ArticulationDrive drive = joint.xDrive;
         drive.target = angle;
         joint.xDrive = drive;
 
-        if (fingerChains.TryGetValue(joint, out var chain))
+        if (fingerChains.TryGetValue(joint, out ArticulationBody[] chain))
         {
-            foreach (var sub_joint in chain)
+            foreach (ArticulationBody subJoint in chain)
             {
-                float ratio = 1f;
-                if (sub_joint.tag.ToLower().Contains("thumb")) 
-                { 
-                    ratio = 0.25f; 
-                }
-
-                SetJointTarget(sub_joint, angle * ratio);
+                float ratio = subJoint.tag.ToLowerInvariant().Contains("thumb") ? 0.25f : 1f;
+                SetJointTarget(subJoint, angle * ratio);
             }
         }
     }
 
-
-    public void ResetJoint(ArticulationBody joint, float joint_default)
+    public void ResetJoint(ArticulationBody joint, float jointDefault)
     {
-        // Reset drive target
-        var drive = joint.xDrive;
-        drive.target = joint_default;
+        ArticulationDrive drive = joint.xDrive;
+        drive.target = jointDefault;
         joint.xDrive = drive;
 
-        // Reset physics state
-        joint.jointPosition = new ArticulationReducedSpace(joint_default); 
+        joint.jointPosition = new ArticulationReducedSpace(jointDefault);
         joint.jointVelocity = new ArticulationReducedSpace(0.0f);
-
-        // Reset rigidbody motion
         joint.linearVelocity = Vector3.zero;
         joint.angularVelocity = Vector3.zero;
 
-        if (fingerChains.TryGetValue(joint, out var chain))
+        if (fingerChains.TryGetValue(joint, out ArticulationBody[] chain))
         {
-            foreach (var sub_joint in chain)
-            {
-                ResetJoint(sub_joint, joint_default);
-            }
+            foreach (ArticulationBody subJoint in chain)
+                ResetJoint(subJoint, jointDefault);
         }
     }
 
-
     public override void OnEpisodeBegin()
     {
-        // move target cube to a random position
-        target.transform.position = new Vector3(Random.Range(0.2f, 1.25f), Random.Range(1.35f, 1.8f), Random.Range(-0.2f, 0.5f));
-        target.transform.localRotation = Quaternion.Euler(0f, 0f, 0f);
+        episodeSteps = 0;
 
-        // reset joint positions, velocities, targets
-        foreach (var joint in activeJoints)
+        rightHandLocked = false;
+        leftHandLocked = false;
+        rightHandReached = false;
+        leftHandReached = false;
+        rightNoProgressSteps = 0;
+        leftNoProgressSteps = 0;
+
+        UpdateTargetCubeVisibility();
+
+        // Choose one goal uniformly from the currently unlocked target cubes.
+        int selectedIndex = Random.Range(0, unlockedTargetCount);
+        target = targetCubes[selectedIndex];
+
+        // Reset joint positions, velocities, targets and accumulated action changes.
+        foreach (ArticulationBody joint in activeJoints)
         {
             ResetJoint(joint, defaultJointTargets[joint]);
             currentJointChanges[joint] = 0f;
         }
 
-        rightHandLocked = false;
-        leftHandLocked = false;
-
-        rightNoProgressSteps = 0;
-        leftNoProgressSteps = 0;
-
         previousRightDistance = Vector3.Distance(
             effector_1.transform.position, target.transform.position);
-
         previousLeftDistance = Vector3.Distance(
             effector_2.transform.position, target.transform.position);
 
@@ -206,15 +245,13 @@ public class NicoAgentReach : Agent
         bestLeftDistance = previousLeftDistance;
     }
 
-
     public override void CollectObservations(VectorSensor sensor)
     {
-        foreach (var joint in activeJoints)
+        foreach (ArticulationBody joint in activeJoints)
         {
             float lower = joint.xDrive.lowerLimit;
             float upper = joint.xDrive.upperLimit;
             float targetAngle = joint.xDrive.target;
-
             float range = upper - lower;
 
             float normalizedTarget = Mathf.Abs(range) < 0.0001f
@@ -224,19 +261,13 @@ public class NicoAgentReach : Agent
             sensor.AddObservation(normalizedTarget);
         }
 
-        // Relative cube positions give the agent information about
-        // where each hand must move.
-        sensor.AddObservation(
-            target.transform.position - effector_1.transform.position);
+        // The policy receives the relative position from each hand to the selected goal cube.
+        sensor.AddObservation(target.transform.position - effector_1.transform.position);
+        sensor.AddObservation(target.transform.position - effector_2.transform.position);
 
-        sensor.AddObservation(
-            target.transform.position - effector_2.transform.position);
-
-        // Inform the policy when an arm has been locked.
         sensor.AddObservation(rightHandLocked ? 1f : 0f);
         sensor.AddObservation(leftHandLocked ? 1f : 0f);
     }
-
 
     private bool IsJointLocked(ArticulationBody joint)
     {
@@ -249,19 +280,19 @@ public class NicoAgentReach : Agent
         return false;
     }
 
-
     public override void OnActionReceived(ActionBuffers actions)
     {
-        float max_change = 2f;
-        float change_magnitude = 0.3f;
+        episodeSteps++;
 
+        float maxChange = 2f;
+        float changeMagnitude = 0.3f;
         float smoothnessSum = 0f;
         float movementSum = 0f;
         int controlledJointCount = 0;
 
-        // Apply actions only to unlocked joints.
+        // Apply actions only to joints that have not been locked.
         foreach (var (joint, action) in activeJoints.Zip(
-            actions.ContinuousActions, (x, y) => (x, y)))
+            actions.ContinuousActions, (joint, action) => (joint, action)))
         {
             if (IsJointLocked(joint))
             {
@@ -270,11 +301,10 @@ public class NicoAgentReach : Agent
             }
 
             float previousChange = currentJointChanges[joint];
-
             currentJointChanges[joint] = Mathf.Clamp(
-                previousChange + action * change_magnitude,
-                -max_change,
-                max_change);
+                previousChange + action * changeMagnitude,
+                -maxChange,
+                maxChange);
 
             float newTarget = Mathf.Clamp(
                 joint.xDrive.target + currentJointChanges[joint],
@@ -283,41 +313,28 @@ public class NicoAgentReach : Agent
 
             SetJointTarget(joint, newTarget);
 
-            // Penalize abrupt changes in movement.
-            smoothnessSum += Mathf.Abs(
-                currentJointChanges[joint] - previousChange) / max_change;
-
-            // Small penalty for continuous joint movement.
-            movementSum += Mathf.Abs(
-                currentJointChanges[joint]) / max_change;
-
+            smoothnessSum += Mathf.Abs(currentJointChanges[joint] - previousChange) / maxChange;
+            movementSum += Mathf.Abs(currentJointChanges[joint]) / maxChange;
             controlledJointCount++;
         }
 
         float normalizer = Mathf.Max(controlledJointCount, 1);
+        float smoothnessPenalty = -smoothnessWeight * smoothnessSum / normalizer;
+        float movementPenalty = -movementWeight * movementSum / normalizer;
 
-        float smoothnessPenalty =
-            -smoothnessWeight * smoothnessSum / normalizer;
-
-        float movementPenalty =
-            -movementWeight * movementSum / normalizer;
-
-        // Measure the distance between each hand and the cube.
         float rightDistance = Vector3.Distance(
-            effector_1.transform.position,
-            target.transform.position);
-
+            effector_1.transform.position, target.transform.position);
         float leftDistance = Vector3.Distance(
-            effector_2.transform.position,
-            target.transform.position);
+            effector_2.transform.position, target.transform.position);
 
         float successReward = 0f;
 
-        // RIGHT HAND: lock on success or prolonged lack of progress.
+        // RIGHT HAND: lock after reaching the goal, or after a prolonged stall.
         if (!rightHandLocked)
         {
             if (rightDistance <= reachDistance)
             {
+                rightHandReached = true;
                 rightHandLocked = true;
                 successReward += reachBonus;
             }
@@ -334,17 +351,16 @@ public class NicoAgentReach : Agent
                 }
 
                 if (rightNoProgressSteps >= noProgressStepsToLock)
-                {
                     rightHandLocked = true;
-                }
             }
         }
 
-        // LEFT HAND: lock on success or prolonged lack of progress.
+        // LEFT HAND: lock after reaching the goal, or after a prolonged stall.
         if (!leftHandLocked)
         {
             if (leftDistance <= reachDistance)
             {
+                leftHandReached = true;
                 leftHandLocked = true;
                 successReward += reachBonus;
             }
@@ -361,35 +377,73 @@ public class NicoAgentReach : Agent
                 }
 
                 if (leftNoProgressSteps >= noProgressStepsToLock)
-                {
                     leftHandLocked = true;
-                }
             }
         }
 
-        // Reward progress toward the cube.
         float progressReward = progressWeight *
             ((previousRightDistance - rightDistance) +
              (previousLeftDistance - leftDistance));
 
-        // Encourage both hands to remain close to the cube.
         float averageDistance = (rightDistance + leftDistance) / 2f;
+        float proximityPenalty = -distancePenaltyWeight * averageDistance;
 
-        float proximityPenalty =
-            -distancePenaltyWeight * averageDistance;
-
-        // Combine all reward components.
-        float totalReward =
-            progressReward +
-            proximityPenalty +
-            successReward +
-            smoothnessPenalty +
-            movementPenalty;
+        float totalReward = progressReward + proximityPenalty + successReward
+            + smoothnessPenalty + movementPenalty;
 
         AddReward(totalReward);
 
-        // Update distances for the next decision.
         previousRightDistance = rightDistance;
         previousLeftDistance = leftDistance;
+
+        // An episode succeeds only when BOTH hands actually reached the selected cube.
+        if (rightHandLocked && leftHandLocked)
+        {
+            FinishEpisode(rightHandReached && leftHandReached);
+            return;
+        }
+
+        // Prevent a stalled episode from running indefinitely. Timeouts count as failures.
+        if (episodeSteps >= maxEpisodeSteps)
+        {
+            FinishEpisode(false);
+            return;
+        }
+    }
+
+    private void FinishEpisode(bool success)
+    {
+        RecordEpisodeResult(success);
+        EndEpisode();
+    }
+
+    private void RecordEpisodeResult(bool success)
+    {
+        int windowSize = Mathf.Max(1, successWindowSize);
+
+        recentEpisodeResults.Enqueue(success);
+        while (recentEpisodeResults.Count > windowSize)
+            recentEpisodeResults.Dequeue();
+
+        // Evaluate only once the full recent-results window is available.
+        if (recentEpisodeResults.Count < windowSize || unlockedTargetCount >= targetCubes.Count)
+            return;
+
+        int successes = recentEpisodeResults.Count(result => result);
+        float successRate = successes / (float)recentEpisodeResults.Count;
+
+        if (successRate >= successRateToUnlockNextTarget)
+        {
+            int oldTargetCount = unlockedTargetCount;
+            unlockedTargetCount = Mathf.Min(unlockedTargetCount + 1, targetCubes.Count);
+
+            // Start a fresh evaluation window for the harder curriculum stage.
+            recentEpisodeResults.Clear();
+            UpdateTargetCubeVisibility();
+
+            Debug.Log(
+                $"[Reach Curriculum] Success rate {successRate:P0} over the last {windowSize} episodes. " +
+                $"Unlocked {unlockedTargetCount}/{targetCubes.Count} target cubes (was {oldTargetCount}).");
+        }
     }
 }

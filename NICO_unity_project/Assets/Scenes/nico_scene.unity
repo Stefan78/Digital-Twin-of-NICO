@@ -1562,23 +1562,23 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   m_BrainParameters:
-    VectorObservationSize: 32
+    VectorObservationSize: 14
     NumStackedVectorObservations: 1
     m_ActionSpec:
-      m_NumContinuousActions: 25
+      m_NumContinuousActions: 6
       BranchSizes: 
-    VectorActionSize: 19000000
+    VectorActionSize: 06000000
     VectorActionDescriptions: []
     VectorActionSpaceType: 1
     hasUpgradedBrainParametersWithActionSpec: 1
-  m_Model: {fileID: 5022602860645237092, guid: e83611a4146f7b642a7cfb7d73f85ad1, type: 3}
+  m_Model: {fileID: 0}
   m_InferenceDevice: 0
   m_BehaviorType: 0
   m_BehaviorName: NICO
   TeamId: 0
   m_UseChildSensors: 1
   m_UseChildActuators: 1
-  m_DeterministicInference: 0
+  m_DeterministicInference: 1
   m_ObservableAttributeHandling: 0
 --- !u!23 &1283652636261150704
 MeshRenderer:
@@ -1641,17 +1641,33 @@ MonoBehaviour:
     maxStep: 0
   hasUpgradedFromAgentParameters: 1
   MaxStep: 5000
-  useLeftHand: 1
-  useRightHand: 1
-  useHead: 1
-  leftHandJoints: []
+  autoDetectRightHandJoints: 1
   rightHandJoints: []
-  headJoints: []
-  targetCubes: []
+  jointControlSettings:
+  - joint: {fileID: 6588012336836055492}
+    isFixed: 1
+    fixedTargetAngle: 60
+  - joint: {fileID: 3731058774771238326}
+    isFixed: 1
+    fixedTargetAngle: 60
+  - joint: {fileID: 2885191027877882584}
+    isFixed: 1
+    fixedTargetAngle: 0
+  - joint: {fileID: 2195224068256062376}
+    isFixed: 1
+    fixedTargetAngle: -40
+  - joint: {fileID: 4032474285315515603}
+    isFixed: 1
+    fixedTargetAngle: 35
   target: {fileID: 3528808699769795005}
-  effector_1: {fileID: 4920977478937393670}
-  effector_2: {fileID: 7825258367879755156}
+  rightHandEffector: {fileID: 7825258367879755156}
+  totalTargetPositions: 2
   initialTargetsUnlocked: 1
+  positionSeed: 12345
+  randomPositionOffsetFromFirst: {x: 0.3, y: 0, z: 0}
+  randomPositionHalfExtents: {x: 0.1, y: 0.1, z: 0.1}
+  minimumPositionSeparation: 0.05
+  episodeSelectionSeed: 67890
   successWindowSize: 50
   successRateToUnlockNextTarget: 0.8
   maxEpisodeSteps: 1000
@@ -1661,7 +1677,9 @@ MonoBehaviour:
   reachBonus: 1
   smoothnessWeight: 0.01
   movementWeight: 0.005
-  noProgressStepsToLock: 100
+  maxAccumulatedChange: 2
+  actionChangeMagnitude: 0.3
+  noProgressStepsToEndEpisode: 100
   noProgressEpsilon: 0.001
 --- !u!1 &1309529149505066341
 GameObject:
@@ -8419,7 +8437,7 @@ Transform:
   m_GameObject: {fileID: 3528808699769795005}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 1.0320001, y: 1.3349, z: 0.251}
+  m_LocalPosition: {x: 1.0320001, y: 1.4579, z: 0.251}
   m_LocalScale: {x: 0.025, y: 0.025, z: 0.025}
   m_ConstrainProportionsScale: 0
   m_Children: []
@@ -8681,7 +8699,7 @@ Transform:
   m_GameObject: {fileID: 7237121755524349940}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 1.03, y: 1.3349, z: 0.072}
+  m_LocalPosition: {x: 1.0297, y: 1.3349, z: -0.02}
   m_LocalScale: {x: 0.025, y: 0.025, z: 0.025}
   m_ConstrainProportionsScale: 0
   m_Children: []

@@ -7,15 +7,21 @@ using Unity.MLAgents.Actuators;
 using Unity.MLAgents.Sensors;
 
 /// <summary>
-/// Trains the NICO right hand to reach a single physical target cube.
+/// Trains the NICO right hand to reach one physical target cube.
+///
+/// The target cube is sampled uniformly inside a BoxCollider assigned as
+/// Target Spawn Volume. The spawn-volume collider may be disabled; its
+/// center and size are still used as geometric data.
+///
+/// Curriculum stages are centered, progressively larger sub-regions of the
+/// full spawn volume. Each stage is unlocked after the configured recent
+/// success-rate threshold is reached.
 ///
 /// Right-hand joints can be configured individually in the Inspector:
-/// - Fixed joints receive a position-drive target angle, but are not NN actions.
-/// - Non-fixed joints are controlled by the neural network.
-///
-/// A fixed joint is NOT physically locked. Its ArticulationDrive attempts to
-/// maintain the requested target; physics can still displace it depending on
-/// stiffness, damping, force limit, and loads in the kinematic chain.
+/// - Fixed joints receive a drive target but are not NN actions.
+/// - Remaining joints are controlled by the neural network.
+/// - All joint positions and all joint accumulated-change values are observed,
+///   so the observation count stays constant when the fixed-joint selection changes.
 /// </summary>
 public class NicoAgentReach : Agent
 {
@@ -28,7 +34,7 @@ public class NicoAgentReach : Agent
         [Tooltip("Enable this to remove the joint from the NN action space and hold its drive target at Fixed Target Angle.")]
         public bool isFixed;
 
-        [Tooltip("Target angle in degrees for revolute joints (or meters for prismatic joints). The ArticulationDrive attempts to maintain this value; it is not a hard physical lock.")]
+        [Tooltip("Target angle in degrees for revolute joints (or meters for prismatic joints). The drive attempts to maintain this value; it is not a hard physical lock.")]
         public float fixedTargetAngle;
     }
 
@@ -48,54 +54,70 @@ public class NicoAgentReach : Agent
     [SerializeField] private List<JointControlSetting> jointControlSettings = new List<JointControlSetting>();
 
     // ---------------------------------------------------------------------
-    // SINGLE CUBE / DETERMINISTIC CURRICULUM
+    // TARGET AND SPAWN VOLUME
     // ---------------------------------------------------------------------
 
-    [Header("Single Target Cube")]
-    [Tooltip("The one physical cube. Its position changes at the beginning of each episode.")]
-    public GameObject target;
+    [Header("Target")]
+    [Tooltip("The one physical target cube. Its world position is changed at the beginning of each episode.")]
+    [SerializeField] private GameObject target;
 
-    [Tooltip("Right-hand end effector. Its distance to the target defines success.")]
-    public GameObject rightHandEffector;
+    [Tooltip("Right-hand end effector. Its distance to the target cube defines success.")]
+    [SerializeField] private GameObject rightHandEffector;
 
-    [Header("Deterministic Target Positions")]
-    [Tooltip("Total number of target positions. Position 1 is the cube's initial scene position; positions 2 onward are generated deterministically.")]
-    [SerializeField, Min(1)] private int totalTargetPositions = 2;
+    [Header("Target Spawn Volume")]
+    [Tooltip("Assign the visible cube that defines the valid target workspace. It must have a BoxCollider on the same GameObject. The BoxCollider can be disabled to prevent physical interactions; this script still reads its center and size.")]
+    [SerializeField] private GameObject targetSpawnVolume;
 
-    [Tooltip("Number of generated positions available at the beginning of training.")]
-    [SerializeField, Min(1)] private int initialTargetsUnlocked = 1;
+    [Tooltip("Extra clearance between the target's collider and each spawn-volume boundary, in TargetSpawnVolume local units. Set to 0 for no extra margin.")]
+    [SerializeField, Min(0f)] private float spawnBoundaryMarginLocal = 0.005f;
 
-    [Tooltip("Seed used to generate the ordered target positions. The same seed and settings reproduce the same positions.")]
-    [SerializeField] private int positionSeed = 12345;
+    [Tooltip("Seed for the deterministic sequence of target positions. Same seed, spawn-volume geometry, and episode order reproduce the same sequence.")]
+    [SerializeField] private int spawnPositionSeed = 12345;
 
-    [Tooltip("Offset from the cube's initial scene position to the centre of the random-position area.")]
-    [SerializeField] private Vector3 randomPositionOffsetFromFirst = new Vector3(0.3f, 0f, 0f);
+    private BoxCollider targetSpawnVolumeCollider;
+    private DeterministicRandom spawnPositionRandom;
+    private Vector3 validTargetPivotMinLocal;
+    private Vector3 validTargetPivotMaxLocal;
+    private Vector3 validTargetPivotCenterLocal;
+    private Vector3 validTargetPivotHalfRangeLocal;
+    private bool spawnVolumeGeometryReady;
 
-    [Tooltip("Half-size of the random-position box on each axis, in world units.")]
-    [SerializeField] private Vector3 randomPositionHalfExtents = new Vector3(0.1f, 0.1f, 0.1f);
+    // ---------------------------------------------------------------------
+    // AREA-BASED CURRICULUM
+    // ---------------------------------------------------------------------
 
-    [Tooltip("Minimum distance between generated positions. If no candidate satisfies it after 100 attempts, the last candidate is used.")]
-    [SerializeField, Min(0f)] private float minimumPositionSeparation = 0.05f;
+    [Header("Area-Based Curriculum")]
+    [Tooltip("Each entry defines the fraction of the FULL valid target-center range available at that curriculum stage, independently for X, Y and Z. Stages should grow or stay equal in every axis. Defaults: central 25%, 50%, 75%, then the full volume.")]
+    [SerializeField]
+    private List<Vector3> curriculumRegionFractions = new List<Vector3>
+    {
+        new Vector3(0.25f, 0.25f, 0.25f),
+        new Vector3(0.50f, 0.50f, 0.50f),
+        new Vector3(0.75f, 0.75f, 0.75f),
+        new Vector3(1.00f, 1.00f, 1.00f)
+    };
 
-    [Tooltip("Separate seed for episode target selection. Reproduces the same target-selection sequence when the episode sequence and curriculum unlocks are the same.")]
-    [SerializeField] private int episodeSelectionSeed = 67890;
+    [Tooltip("Number of curriculum stages available at the beginning. Usually 1 for training; set to the total number of stages to sample the full volume immediately.")]
+    [SerializeField, Min(1)] private int initialCurriculumStagesUnlocked = 1;
 
-    private readonly List<Vector3> generatedTargetPositions = new List<Vector3>();
-    private Vector3 firstTargetPosition;
-    private int unlockedTargetCount;
-    private DeterministicRandom episodeSelectionRandom;
+    [Tooltip("When enabled, the success-rate window unlocks progressively larger regions. Disable for inference/evaluation to keep the selected region fixed.")]
+    [SerializeField] private bool enableCurriculumProgression = true;
+
+    [Tooltip("Number of completed episodes used to evaluate whether the next, larger region should be unlocked.")]
+    [SerializeField, Min(1)] private int successWindowSize = 50;
+
+    [Tooltip("Unlock the next, larger spawn region when the recent success rate reaches this value.")]
+    [SerializeField, Range(0f, 1f)] private float successRateToUnlockNextRegion = 0.8f;
+
+    private int unlockedCurriculumStageCount;
     private readonly Queue<bool> recentEpisodeResults = new Queue<bool>();
 
     // ---------------------------------------------------------------------
-    // CURRICULUM / EPISODE SETTINGS
+    // EPISODE SETTINGS
     // ---------------------------------------------------------------------
 
-    [Header("Curriculum")]
-    [SerializeField, Min(1)] private int successWindowSize = 50;
-    [SerializeField, Range(0f, 1f)] private float successRateToUnlockNextTarget = 0.8f;
-
     [Header("Episode Length")]
-    [Tooltip("Maximum number of Agent decisions in one episode. A timeout counts as a failure.")]
+    [Tooltip("Maximum number of Agent decisions in one episode. A timeout counts as a failed reaching episode.")]
     [SerializeField, Min(1)] private int maxEpisodeSteps = 1000;
     private int episodeSteps;
 
@@ -116,10 +138,10 @@ public class NicoAgentReach : Agent
     // ---------------------------------------------------------------------
 
     [Header("Action Settings")]
-    [Tooltip("Maximum target increment per decision after action smoothing, in ArticulationDrive target units (degrees for revolute joints).")]
+    [Tooltip("Maximum accumulated target-step command per decision, in ArticulationDrive target units (degrees for revolute joints). This limits the per-decision target increment, not the total joint range.")]
     [SerializeField, Min(0f)] private float maxAccumulatedChange = 2f;
 
-    [Tooltip("How quickly the target increment changes in response to the NN action.")]
+    [Tooltip("How quickly the accumulated target-step command changes in response to the NN action.")]
     [SerializeField, Min(0f)] private float actionChangeMagnitude = 0.3f;
 
     // ---------------------------------------------------------------------
@@ -131,7 +153,7 @@ public class NicoAgentReach : Agent
     [SerializeField, Min(0f)] private float noProgressEpsilon = 0.001f;
 
     // ---------------------------------------------------------------------
-    // RUNTIME DATA
+    // RUNTIME JOINT DATA
     // ---------------------------------------------------------------------
 
     private readonly List<ArticulationBody> nnControlledJoints = new List<ArticulationBody>();
@@ -150,8 +172,8 @@ public class NicoAgentReach : Agent
     private bool actionSizeWarningIssued;
 
     /// <summary>
-    /// Small deterministic pseudo-random generator. Separate instances are used
-    /// for position generation and episode target selection.
+    /// Small deterministic pseudo-random generator. It avoids depending on
+    /// UnityEngine.Random and makes the target-position sequence repeatable.
     /// </summary>
     private sealed class DeterministicRandom
     {
@@ -176,17 +198,11 @@ public class NicoAgentReach : Agent
 
         public float Range(float minInclusive, float maxExclusive)
         {
-            float unit = (NextUInt() >> 8) * (1f / 16777216f);
-            return minInclusive + (maxExclusive - minInclusive) * unit;
-        }
-
-        public int Range(int minInclusive, int maxExclusive)
-        {
             if (maxExclusive <= minInclusive)
                 return minInclusive;
 
-            uint range = (uint)(maxExclusive - minInclusive);
-            return minInclusive + (int)(NextUInt() % range);
+            float unit = (NextUInt() >> 8) * (1f / 16777216f);
+            return minInclusive + (maxExclusive - minInclusive) * unit;
         }
     }
 
@@ -219,6 +235,14 @@ public class NicoAgentReach : Agent
             return;
         }
 
+        if (!InitializeSpawnVolume())
+        {
+            enabled = false;
+            return;
+        }
+
+        ValidateCurriculumStages();
+
         PrepareRightHandJointList();
         if (rightHandJoints.Count == 0)
         {
@@ -239,10 +263,9 @@ public class NicoAgentReach : Agent
             return;
         }
 
-        firstTargetPosition = target.transform.position;
-        GenerateTargetPositionsDeterministically();
-        unlockedTargetCount = Mathf.Clamp(initialTargetsUnlocked, 1, generatedTargetPositions.Count);
-        episodeSelectionRandom = new DeterministicRandom(episodeSelectionSeed);
+        spawnPositionRandom = new DeterministicRandom(spawnPositionSeed);
+        unlockedCurriculumStageCount = Mathf.Clamp(
+            initialCurriculumStagesUnlocked, 1, curriculumRegionFractions.Count);
 
         foreach (ArticulationBody joint in nnControlledJoints)
         {
@@ -251,6 +274,215 @@ public class NicoAgentReach : Agent
         }
 
         LogJointConfiguration();
+        LogSpawnVolumeConfiguration();
+    }
+
+    private bool InitializeSpawnVolume()
+    {
+        if (targetSpawnVolume == null)
+        {
+            Debug.LogError("NicoAgentReach: assign the TargetSpawnVolume cube GameObject in the Inspector.");
+            return false;
+        }
+
+        if (targetSpawnVolume == target)
+        {
+            Debug.LogError("NicoAgentReach: Target and Target Spawn Volume must be two different GameObjects.");
+            return false;
+        }
+
+        if (targetSpawnVolume.transform.IsChildOf(target.transform))
+        {
+            Debug.LogError(
+                "NicoAgentReach: TargetSpawnVolume cannot be a child of the moving Target object, " +
+                "because it would move whenever the target is repositioned.");
+            return false;
+        }
+
+        targetSpawnVolumeCollider = targetSpawnVolume.GetComponent<BoxCollider>();
+        if (targetSpawnVolumeCollider == null)
+        {
+            Debug.LogError("NicoAgentReach: TargetSpawnVolume must have a BoxCollider on the same GameObject.");
+            return false;
+        }
+
+        if (targetSpawnVolumeCollider.size.x <= 0f ||
+            targetSpawnVolumeCollider.size.y <= 0f ||
+            targetSpawnVolumeCollider.size.z <= 0f)
+        {
+            Debug.LogError("NicoAgentReach: TargetSpawnVolume BoxCollider must have positive size on all axes.");
+            return false;
+        }
+
+        CacheTargetColliderOffsetsAndCalculateValidRange();
+
+        if (validTargetPivotMinLocal.x > validTargetPivotMaxLocal.x ||
+            validTargetPivotMinLocal.y > validTargetPivotMaxLocal.y ||
+            validTargetPivotMinLocal.z > validTargetPivotMaxLocal.z)
+        {
+            Debug.LogError(
+                "NicoAgentReach: the target cube is too large to fit inside TargetSpawnVolume " +
+                "with the current Spawn Boundary Margin. Enlarge the volume or reduce the margin.");
+            return false;
+        }
+
+        spawnVolumeGeometryReady = true;
+        return true;
+    }
+
+    private void CacheTargetColliderOffsetsAndCalculateValidRange()
+    {
+        Vector3 offsetMin = Vector3.zero;
+        Vector3 offsetMax = Vector3.zero;
+        bool foundAnyBounds = false;
+
+        Collider[] colliders = target.GetComponentsInChildren<Collider>(true);
+
+        foreach (Collider targetCollider in colliders)
+        {
+            if (targetCollider == null)
+                continue;
+
+            BoxCollider box = targetCollider as BoxCollider;
+            if (box != null)
+            {
+                Vector3 half = box.size * 0.5f;
+
+                for (int corner = 0; corner < 8; corner++)
+                {
+                    Vector3 sign = new Vector3(
+                        (corner & 1) == 0 ? -1f : 1f,
+                        (corner & 2) == 0 ? -1f : 1f,
+                        (corner & 4) == 0 ? -1f : 1f);
+
+                    Vector3 pointInBoxLocal = box.center + Vector3.Scale(half, sign);
+                    Vector3 pointWorld = box.transform.TransformPoint(pointInBoxLocal);
+                    Vector3 offsetInSpawnLocal = targetSpawnVolume.transform.InverseTransformVector(
+                        pointWorld - target.transform.position);
+
+                    EncapsulateOffset(offsetInSpawnLocal, ref offsetMin, ref offsetMax, ref foundAnyBounds);
+                }
+            }
+            else if (targetCollider.enabled)
+            {
+                // Conservative fallback for non-box collider shapes: use their world AABB corners.
+                AddWorldBoundsCorners(targetCollider.bounds, ref offsetMin, ref offsetMax, ref foundAnyBounds);
+            }
+        }
+
+        // If the target has no Collider components, use its Renderer bounds so the visible
+        // target still fits inside the volume. This is a conservative world-AABB approximation.
+        if (!foundAnyBounds)
+        {
+            Renderer[] renderers = target.GetComponentsInChildren<Renderer>(true);
+            foreach (Renderer targetRenderer in renderers)
+            {
+                if (targetRenderer != null && targetRenderer.enabled)
+                    AddWorldBoundsCorners(targetRenderer.bounds, ref offsetMin, ref offsetMax, ref foundAnyBounds);
+            }
+        }
+
+        if (!foundAnyBounds)
+        {
+            offsetMin = Vector3.zero;
+            offsetMax = Vector3.zero;
+            Debug.LogWarning(
+                "NicoAgentReach: no enabled target Collider or Renderer bounds were found. " +
+                "The target pivot alone will be constrained to the spawn volume.");
+        }
+
+        Vector3 volumeMin = targetSpawnVolumeCollider.center - targetSpawnVolumeCollider.size * 0.5f;
+        Vector3 volumeMax = targetSpawnVolumeCollider.center + targetSpawnVolumeCollider.size * 0.5f;
+
+        Vector3 margin = Vector3.one * spawnBoundaryMarginLocal;
+        volumeMin += margin;
+        volumeMax -= margin;
+
+        // A target pivot is valid only if every target-collider corner remains inside the volume.
+        validTargetPivotMinLocal = volumeMin - offsetMin;
+        validTargetPivotMaxLocal = volumeMax - offsetMax;
+        validTargetPivotCenterLocal = (validTargetPivotMinLocal + validTargetPivotMaxLocal) * 0.5f;
+        validTargetPivotHalfRangeLocal = (validTargetPivotMaxLocal - validTargetPivotMinLocal) * 0.5f;
+    }
+
+    private void AddWorldBoundsCorners(
+        Bounds worldBounds,
+        ref Vector3 offsetMin,
+        ref Vector3 offsetMax,
+        ref bool foundAnyBounds)
+    {
+        Vector3 half = worldBounds.extents;
+
+        for (int corner = 0; corner < 8; corner++)
+        {
+            Vector3 sign = new Vector3(
+                (corner & 1) == 0 ? -1f : 1f,
+                (corner & 2) == 0 ? -1f : 1f,
+                (corner & 4) == 0 ? -1f : 1f);
+
+            Vector3 pointWorld = worldBounds.center + Vector3.Scale(half, sign);
+            Vector3 offsetInSpawnLocal = targetSpawnVolume.transform.InverseTransformVector(
+                pointWorld - target.transform.position);
+
+            EncapsulateOffset(offsetInSpawnLocal, ref offsetMin, ref offsetMax, ref foundAnyBounds);
+        }
+    }
+
+    private static void EncapsulateOffset(
+        Vector3 offset,
+        ref Vector3 offsetMin,
+        ref Vector3 offsetMax,
+        ref bool initialized)
+    {
+        if (!initialized)
+        {
+            offsetMin = offset;
+            offsetMax = offset;
+            initialized = true;
+            return;
+        }
+
+        offsetMin = Vector3.Min(offsetMin, offset);
+        offsetMax = Vector3.Max(offsetMax, offset);
+    }
+
+    private void ValidateCurriculumStages()
+    {
+        if (curriculumRegionFractions == null)
+            curriculumRegionFractions = new List<Vector3>();
+
+        if (curriculumRegionFractions.Count == 0)
+            curriculumRegionFractions.Add(Vector3.one);
+
+        Vector3 previous = Vector3.zero;
+
+        for (int i = 0; i < curriculumRegionFractions.Count; i++)
+        {
+            Vector3 requested = curriculumRegionFractions[i];
+            Vector3 stage = new Vector3(
+                Mathf.Clamp01(requested.x),
+                Mathf.Clamp01(requested.y),
+                Mathf.Clamp01(requested.z));
+
+            if (i > 0)
+            {
+                Vector3 expanded = new Vector3(
+                    Mathf.Max(stage.x, previous.x),
+                    Mathf.Max(stage.y, previous.y),
+                    Mathf.Max(stage.z, previous.z));
+
+                if (expanded != stage)
+                {
+                    Debug.LogWarning(
+                        $"NicoAgentReach: curriculum region {i + 1} was smaller than the previous stage " +
+                        "on at least one axis. It has been expanded to avoid curriculum regression.");
+                    stage = expanded;
+                }
+            }
+
+            curriculumRegionFractions[i] = stage;
+            previous = stage;
+        }
     }
 
     private void PrepareRightHandJointList()
@@ -371,69 +603,55 @@ public class NicoAgentReach : Agent
             }
         }
 
+        int expectedObservations = rightHandJoints.Count * 2 + 3;
         Debug.Log(
             $"[NicoAgentReach] Right-hand joints: {rightHandJoints.Count}; " +
             $"fixed: {fixedJointTargets.Count}; NN-controlled: {nnControlledJoints.Count}. " +
-            $"Expected Behavior Parameters: {rightHandJoints.Count + 3} vector observations, " +
+            $"Expected Behavior Parameters: {expectedObservations} vector observations, " +
             $"{nnControlledJoints.Count} continuous actions.");
     }
 
-    // ---------------------------------------------------------------------
-    // DETERMINISTIC TARGET POSITION GENERATION
-    // ---------------------------------------------------------------------
-
-    /// <summary>
-    /// Position 1 is the cube's initial scene position. Positions 2 onward are
-    /// sampled deterministically from positionSeed.
-    /// </summary>
-    private void GenerateTargetPositionsDeterministically()
+    private void LogSpawnVolumeConfiguration()
     {
-        generatedTargetPositions.Clear();
-        generatedTargetPositions.Add(firstTargetPosition);
+        Debug.Log(
+            "[NicoAgentReach] TargetSpawnVolume ready. " +
+            $"Valid target-pivot range in volume-local coordinates: min={validTargetPivotMinLocal}, " +
+            $"max={validTargetPivotMaxLocal}. " +
+            $"Spawn volume BoxCollider enabled={targetSpawnVolumeCollider.enabled} (it may remain disabled).");
 
-        int count = Mathf.Max(1, totalTargetPositions);
-        DeterministicRandom positionRandom = new DeterministicRandom(positionSeed);
-
-        Vector3 centre = firstTargetPosition + randomPositionOffsetFromFirst;
-        Vector3 extents = new Vector3(
-            Mathf.Abs(randomPositionHalfExtents.x),
-            Mathf.Abs(randomPositionHalfExtents.y),
-            Mathf.Abs(randomPositionHalfExtents.z));
-
-        for (int i = 1; i < count; i++)
+        for (int i = 0; i < curriculumRegionFractions.Count; i++)
         {
-            Vector3 candidate = centre;
-            bool sufficientlySeparated = false;
-
-            for (int attempt = 0; attempt < 100; attempt++)
-            {
-                candidate = new Vector3(
-                    positionRandom.Range(centre.x - extents.x, centre.x + extents.x),
-                    positionRandom.Range(centre.y - extents.y, centre.y + extents.y),
-                    positionRandom.Range(centre.z - extents.z, centre.z + extents.z));
-
-                sufficientlySeparated = generatedTargetPositions.All(
-                    existing => Vector3.Distance(existing, candidate) >= minimumPositionSeparation);
-
-                if (sufficientlySeparated)
-                    break;
-            }
-
-            if (!sufficientlySeparated)
-            {
-                Debug.LogWarning(
-                    "NicoAgentReach: could not generate a position satisfying Minimum Position Separation " +
-                    "after 100 attempts. The last candidate will be used. Increase the random-position area " +
-                    "or reduce Minimum Position Separation.");
-            }
-
-            generatedTargetPositions.Add(candidate);
+            Debug.Log(
+                $"[NicoAgentReach] Curriculum region {i + 1}/{curriculumRegionFractions.Count}: " +
+                $"fraction={curriculumRegionFractions[i]}");
         }
+    }
 
-        for (int i = 0; i < generatedTargetPositions.Count; i++)
-        {
-            Debug.Log($"[Reach Curriculum] Target position {i + 1}/{generatedTargetPositions.Count}: {generatedTargetPositions[i]}");
-        }
+    // ---------------------------------------------------------------------
+    // TARGET POSITION SAMPLING INSIDE THE SPAWN VOLUME
+    // ---------------------------------------------------------------------
+
+    private Vector3 GetCurrentCurriculumRegionFraction()
+    {
+        int stageIndex = Mathf.Clamp(
+            unlockedCurriculumStageCount - 1,
+            0,
+            curriculumRegionFractions.Count - 1);
+
+        return curriculumRegionFractions[stageIndex];
+    }
+
+    private Vector3 GenerateRandomTargetWorldPosition()
+    {
+        Vector3 fraction = GetCurrentCurriculumRegionFraction();
+        Vector3 regionHalfRange = Vector3.Scale(validTargetPivotHalfRangeLocal, fraction);
+
+        Vector3 localTargetPivot = validTargetPivotCenterLocal + new Vector3(
+            spawnPositionRandom.Range(-regionHalfRange.x, regionHalfRange.x),
+            spawnPositionRandom.Range(-regionHalfRange.y, regionHalfRange.y),
+            spawnPositionRandom.Range(-regionHalfRange.z, regionHalfRange.z));
+
+        return targetSpawnVolume.transform.TransformPoint(localTargetPivot);
     }
 
     // ---------------------------------------------------------------------
@@ -469,9 +687,8 @@ public class NicoAgentReach : Agent
     }
 
     /// <summary>
-    /// Resets a joint to a known pose at the start of an episode. This is called
-    /// only at episode boundaries; fixed joints are not teleported or overwritten
-    /// every simulation step. During the episode their drives respond to physics.
+    /// Resets a joint at episode boundaries. Fixed joints are then maintained
+    /// by their articulation drives and are not overwritten every simulation step.
     /// </summary>
     private void ResetJointState(ArticulationBody joint, float targetValue)
     {
@@ -499,8 +716,8 @@ public class NicoAgentReach : Agent
 
         if (joint.dofCount > 0)
         {
-            // ArticulationDrive.target uses degrees for revolute joints, while
-            // jointPosition uses radians. Prismatic coordinates use meters in both.
+            // ArticulationDrive.target uses degrees for revolute joints,
+            // while ArticulationBody.jointPosition uses radians.
             float reducedCoordinate = joint.jointType == ArticulationJointType.PrismaticJoint
                 ? targetValue
                 : targetValue * Mathf.Deg2Rad;
@@ -514,8 +731,8 @@ public class NicoAgentReach : Agent
     }
 
     /// <summary>
-    /// Returns the current physical joint coordinate in the same units as xDrive
-    /// (degrees for revolute joints, meters for prismatic joints).
+    /// Returns the current physical joint coordinate in xDrive units:
+    /// degrees for revolute joints and meters for prismatic joints.
     /// </summary>
     private static float GetCurrentJointCoordinate(ArticulationBody joint)
     {
@@ -551,12 +768,11 @@ public class NicoAgentReach : Agent
         noProgressSteps = 0;
         actionSizeWarningIssued = false;
 
-        // Choose one currently unlocked position using the independent seeded stream.
-        int selectedIndex = episodeSelectionRandom.Range(0, unlockedTargetCount);
-        target.transform.position = generatedTargetPositions[selectedIndex];
+        // Sample a new target position uniformly inside the currently unlocked
+        // curriculum sub-cuboid. The one target GameObject is reused every episode.
+        target.transform.position = GenerateRandomTargetWorldPosition();
 
         // Reset configured fixed joints to their requested starting pose.
-        // After this reset, their ArticulationDrives (not the NN) maintain the targets.
         foreach (KeyValuePair<ArticulationBody, float> fixedJoint in fixedJointTargets)
             ResetJointState(fixedJoint.Key, fixedJoint.Value);
 
@@ -574,13 +790,23 @@ public class NicoAgentReach : Agent
 
     public override void CollectObservations(VectorSensor sensor)
     {
-        // Observe the CURRENT PHYSICAL position of every configured right-hand joint,
-        // including fixed joints. This lets the policy observe physics-induced deviations.
+        // 1. Observe the CURRENT PHYSICAL coordinate of every right-hand joint.
+        // This includes fixed joints and makes physics-induced deviations observable.
         foreach (ArticulationBody joint in rightHandJoints)
             sensor.AddObservation(NormalizeJointCoordinate(joint));
 
-        // Relative target position from the right-hand end effector (3 values).
-        sensor.AddObservation(target.transform.position - rightHandEffector.transform.position);
+        // 2. Observe accumulated action-change commands for ALL right-hand joints.
+        // Fixed joints have no NN command, so TryGetValue returns zero for them.
+        float changeScale = Mathf.Max(maxAccumulatedChange, 0.0001f);
+        foreach (ArticulationBody joint in rightHandJoints)
+        {
+            currentJointChanges.TryGetValue(joint, out float accumulatedChange);
+            sensor.AddObservation(Mathf.Clamp(accumulatedChange / changeScale, -1f, 1f));
+        }
+
+        // 3. Relative target position from the right-hand end effector (3 values).
+        sensor.AddObservation(
+            target.transform.position - rightHandEffector.transform.position);
     }
 
     public override void OnActionReceived(ActionBuffers actions)
@@ -608,12 +834,8 @@ public class NicoAgentReach : Agent
             ArticulationBody joint = nnControlledJoints[i];
             float action = Mathf.Clamp(actions.ContinuousActions[i], -1f, 1f);
 
-            // Preserve the incremental controller used by the original agent:
-            // the NN action changes a bounded target-step command, and that
-            // command is added to the CURRENT drive target each decision.
-            // This lets the joint travel through its full drive range. It is
-            // deliberately not restricted to a tiny offset around its
-            // episode-start target.
+            // Incremental controller: NN output changes a bounded target-step command.
+            // The resulting increment is added to the current ArticulationDrive target.
             float previousChange = currentJointChanges[joint];
             currentJointChanges[joint] = Mathf.Clamp(
                 previousChange + action * actionChangeMagnitude,
@@ -678,14 +900,14 @@ public class NicoAgentReach : Agent
 
     public override void Heuristic(in ActionBuffers actionsOut)
     {
-        // Neutral actions for Heuristic/manual mode. Training uses the NN policy.
+        // Neutral actions for Heuristic/manual mode. Training and inference use the policy.
         ActionSegment<float> continuousActions = actionsOut.ContinuousActions;
         for (int i = 0; i < continuousActions.Length; i++)
             continuousActions[i] = 0f;
     }
 
     // ---------------------------------------------------------------------
-    // CURRICULUM PROGRESSION
+    // AREA-BASED CURRICULUM PROGRESSION
     // ---------------------------------------------------------------------
 
     private void FinishEpisode(bool success)
@@ -696,27 +918,86 @@ public class NicoAgentReach : Agent
 
     private void RecordEpisodeResult(bool success)
     {
+        if (!enableCurriculumProgression)
+            return;
+
         int windowSize = Mathf.Max(1, successWindowSize);
 
         recentEpisodeResults.Enqueue(success);
         while (recentEpisodeResults.Count > windowSize)
             recentEpisodeResults.Dequeue();
 
-        if (recentEpisodeResults.Count < windowSize || unlockedTargetCount >= generatedTargetPositions.Count)
+        if (recentEpisodeResults.Count < windowSize ||
+            unlockedCurriculumStageCount >= curriculumRegionFractions.Count)
             return;
 
         int successes = recentEpisodeResults.Count(result => result);
         float successRate = successes / (float)recentEpisodeResults.Count;
 
-        if (successRate >= successRateToUnlockNextTarget)
+        if (successRate >= successRateToUnlockNextRegion)
         {
-            int oldTargetCount = unlockedTargetCount;
-            unlockedTargetCount = Mathf.Min(unlockedTargetCount + 1, generatedTargetPositions.Count);
+            int oldStageCount = unlockedCurriculumStageCount;
+            unlockedCurriculumStageCount = Mathf.Min(
+                unlockedCurriculumStageCount + 1,
+                curriculumRegionFractions.Count);
             recentEpisodeResults.Clear();
 
+            Vector3 newlyUnlockedFraction = curriculumRegionFractions[unlockedCurriculumStageCount - 1];
             Debug.Log(
                 $"[Reach Curriculum] Success rate {successRate:P0} over the last {windowSize} episodes. " +
-                $"Unlocked {unlockedTargetCount}/{generatedTargetPositions.Count} target positions (was {oldTargetCount}).");
+                $"Unlocked region {unlockedCurriculumStageCount}/{curriculumRegionFractions.Count} " +
+                $"(was {oldStageCount}/{curriculumRegionFractions.Count}); " +
+                $"region fraction={newlyUnlockedFraction}. ");
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // SCENE VIEW GIZMOS
+    // ---------------------------------------------------------------------
+
+    private void OnDrawGizmosSelected()
+    {
+        if (targetSpawnVolume == null)
+            return;
+
+        BoxCollider volumeCollider = targetSpawnVolume.GetComponent<BoxCollider>();
+        if (volumeCollider == null)
+            return;
+
+        Matrix4x4 previousMatrix = Gizmos.matrix;
+        Color previousColor = Gizmos.color;
+
+        Gizmos.matrix = targetSpawnVolume.transform.localToWorldMatrix;
+
+        // Full spawn volume.
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawWireCube(volumeCollider.center, volumeCollider.size);
+
+        // Currently active curriculum sub-region. Once initialized, this outline
+        // uses the safe target-pivot range (it accounts for the target cube size).
+        if (curriculumRegionFractions != null && curriculumRegionFractions.Count > 0)
+        {
+            int stageIndex = Application.isPlaying
+                ? Mathf.Clamp(unlockedCurriculumStageCount - 1, 0, curriculumRegionFractions.Count - 1)
+                : 0;
+
+            Vector3 fraction = curriculumRegionFractions[stageIndex];
+            Gizmos.color = Color.yellow;
+
+            if (spawnVolumeGeometryReady)
+            {
+                Vector3 regionHalfRange = Vector3.Scale(validTargetPivotHalfRangeLocal, fraction);
+                Gizmos.DrawWireCube(validTargetPivotCenterLocal, regionHalfRange * 2f);
+            }
+            else
+            {
+                Gizmos.DrawWireCube(
+                    volumeCollider.center,
+                    Vector3.Scale(volumeCollider.size, fraction));
+            }
+        }
+
+        Gizmos.matrix = previousMatrix;
+        Gizmos.color = previousColor;
     }
 }

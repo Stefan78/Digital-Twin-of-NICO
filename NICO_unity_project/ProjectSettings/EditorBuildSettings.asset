@@ -6,7 +6,7 @@ EditorBuildSettings:
   serializedVersion: 2
   m_Scenes:
   - enabled: 1
-    path: Assets/Scenes/nico_scene.unity
+    path: Assets/Scenes/reaching_baseline.unity
     guid: 6e1a0bd1d66299c41aefa63999ac666d
   m_configObjects: {}
   m_UseUCBPForAssetBundles: 0

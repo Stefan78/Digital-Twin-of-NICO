@@ -15,13 +15,15 @@ using Unity.MLAgents.Sensors;
 ///
 /// Curriculum stages are centered, progressively larger sub-regions of the
 /// full spawn volume. Each stage is unlocked after the configured recent
-/// success-rate threshold is reached.
+/// success-rate threshold is reached. After first reaching the target, the NN
+/// can continue controlling the hand for a configurable post-reach interval.
 ///
 /// Right-hand joints can be configured individually in the Inspector:
 /// - Fixed joints receive a drive target but are not NN actions.
 /// - Remaining joints are controlled by the neural network.
 /// - All joint positions and all joint accumulated-change values are observed,
 ///   so the observation count stays constant when the fixed-joint selection changes.
+/// - The policy also observes whether it is in the post-reach holding phase.
 /// </summary>
 public class NicoAgentReach : Agent
 {
@@ -117,9 +119,26 @@ public class NicoAgentReach : Agent
     // ---------------------------------------------------------------------
 
     [Header("Episode Length")]
-    [Tooltip("Maximum number of Agent decisions in one episode. A timeout counts as a failed reaching episode.")]
+    [Tooltip("Maximum number of Agent decisions allowed to reach the target. After reaching, the configured Post-Reach Steps are added as an extra continuation phase.")]
     [SerializeField, Min(1)] private int maxEpisodeSteps = 1000;
     private int episodeSteps;
+
+    // ---------------------------------------------------------------------
+    // POST-REACH BEHAVIOUR
+    // ---------------------------------------------------------------------
+
+    [Header("Post-Reach Behaviour")]
+    [Tooltip("Number of additional Agent decisions to continue controlling the hand after it first reaches the target. Set to 0 to end the episode immediately on reaching, as in the original behaviour.")]
+    [SerializeField, Min(0)] private int postReachSteps = 100;
+
+    [Tooltip("Distance penalty applied on every post-reach decision. This encourages the hand to remain close to the target while the NN continues controlling it. Start around 0.2 and adjust after observing training.")]
+    [SerializeField, Min(0f)] private float postReachDistancePenaltyWeight = 0.2f;
+
+    [Tooltip("Adds one observation: 0 while approaching and 1 during post-reach continuation. Recommended for new training (observation size increases by one). Disable only when testing a legacy model trained without this observation.")]
+    [SerializeField] private bool includePostReachPhaseObservation = true;
+
+    private bool hasReachedTarget;
+    private int postReachStepsElapsed;
 
     // ---------------------------------------------------------------------
     // REWARD SETTINGS
@@ -603,7 +622,8 @@ public class NicoAgentReach : Agent
             }
         }
 
-        int expectedObservations = rightHandJoints.Count * 2 + 3;
+        int expectedObservations = rightHandJoints.Count * 2 + 3 +
+            (includePostReachPhaseObservation ? 1 : 0);
         Debug.Log(
             $"[NicoAgentReach] Right-hand joints: {rightHandJoints.Count}; " +
             $"fixed: {fixedJointTargets.Count}; NN-controlled: {nnControlledJoints.Count}. " +
@@ -767,6 +787,8 @@ public class NicoAgentReach : Agent
         episodeSteps = 0;
         noProgressSteps = 0;
         actionSizeWarningIssued = false;
+        hasReachedTarget = false;
+        postReachStepsElapsed = 0;
 
         // Sample a new target position uniformly inside the currently unlocked
         // curriculum sub-cuboid. The one target GameObject is reused every episode.
@@ -807,6 +829,13 @@ public class NicoAgentReach : Agent
         // 3. Relative target position from the right-hand end effector (3 values).
         sensor.AddObservation(
             target.transform.position - rightHandEffector.transform.position);
+
+        // 4. Optional phase indicator: 0 while approaching, 1 after first reaching.
+        // This lets the policy distinguish approach behaviour from post-reach holding,
+        // even if the hand temporarily drifts outside the reach radius. Disable only
+        // when the assigned legacy model expects the previous observation size.
+        if (includePostReachPhaseObservation)
+            sensor.AddObservation(hasReachedTarget ? 1f : 0f);
     }
 
     public override void OnActionReceived(ActionBuffers actions)
@@ -828,14 +857,14 @@ public class NicoAgentReach : Agent
         int controlledJointCount = 0;
         int actionCount = Mathf.Min(availableActions, nnControlledJoints.Count);
 
-        // Only non-fixed joints appear in nnControlledJoints and receive NN actions.
+        // The NN continues controlling every non-fixed joint both before and
+        // after reaching the target. No joints are frozen in the post-reach phase.
         for (int i = 0; i < actionCount; i++)
         {
             ArticulationBody joint = nnControlledJoints[i];
             float action = Mathf.Clamp(actions.ContinuousActions[i], -1f, 1f);
 
             // Incremental controller: NN output changes a bounded target-step command.
-            // The resulting increment is added to the current ArticulationDrive target.
             float previousChange = currentJointChanges[joint];
             currentJointChanges[joint] = Mathf.Clamp(
                 previousChange + action * actionChangeMagnitude,
@@ -862,36 +891,89 @@ public class NicoAgentReach : Agent
         float distance = Vector3.Distance(
             rightHandEffector.transform.position, target.transform.position);
 
-        float progressReward = progressWeight * (previousDistance - distance);
-        float proximityPenalty = -distancePenaltyWeight * distance;
-        float successReward = distance <= reachDistance ? reachBonus : 0f;
+        float progressReward = 0f;
+        float proximityPenalty;
+        float successReward = 0f;
 
-        AddReward(progressReward + proximityPenalty + successReward + smoothnessPenalty + movementPenalty);
-        previousDistance = distance;
-
-        if (distance < bestDistance - noProgressEpsilon)
+        if (!hasReachedTarget)
         {
-            bestDistance = distance;
-            noProgressSteps = 0;
+            // Before the first successful reach, preserve the original progress
+            // shaping and ordinary proximity penalty.
+            progressReward = progressWeight * (previousDistance - distance);
+            proximityPenalty = -distancePenaltyWeight * distance;
+
+            if (distance <= reachDistance)
+            {
+                hasReachedTarget = true;
+                postReachStepsElapsed = 0;
+                successReward = reachBonus; // Award only once, on first contact.
+
+                Debug.Log(
+                    $"[NicoAgentReach] Target reached. Continuing NN control for " +
+                    $"{postReachSteps} additional decisions.");
+            }
         }
         else
         {
-            noProgressSteps++;
+            // During the post-reach phase, stop rewarding incremental approach.
+            // Instead, penalize distance from the target on every decision while
+            // the NN remains fully active. Movement and smoothness penalties also
+            // continue, encouraging small/settled control commands.
+            proximityPenalty = -postReachDistancePenaltyWeight * distance;
+            postReachStepsElapsed++;
         }
 
-        if (distance <= reachDistance)
+        AddReward(
+            progressReward + proximityPenalty + successReward +
+            smoothnessPenalty + movementPenalty);
+
+        previousDistance = distance;
+
+        if (hasReachedTarget)
         {
-            FinishEpisode(true);
-            return;
-        }
+            // A zero value preserves immediate termination after reaching.
+            if (postReachSteps <= 0)
+            {
+                FinishEpisode(true);
+                return;
+            }
 
-        if (noProgressSteps >= noProgressStepsToEndEpisode)
+            // The target remains at the same sampled position. The hand continues
+            // receiving NN actions for the configured number of additional decisions.
+            if (postReachStepsElapsed >= postReachSteps)
+            {
+                // Count this episode as successful only if the hand is still within
+                // the reach tolerance when the post-reach phase finishes.
+                bool heldNearTarget = distance <= reachDistance;
+                FinishEpisode(heldNearTarget);
+                return;
+            }
+        }
+        else
         {
-            FinishEpisode(false);
-            return;
+            // Stall detection applies only before the first successful reach.
+            // It must not interrupt the configured post-reach continuation phase.
+            if (distance < bestDistance - noProgressEpsilon)
+            {
+                bestDistance = distance;
+                noProgressSteps = 0;
+            }
+            else
+            {
+                noProgressSteps++;
+            }
+
+            if (noProgressSteps >= noProgressStepsToEndEpisode)
+            {
+                FinishEpisode(false);
+                return;
+            }
         }
 
-        if (episodeSteps >= maxEpisodeSteps)
+        // maxEpisodeSteps is the maximum time allowed to reach the target.
+        // Once the target is reached, the full post-reach interval is allowed
+        // even if the reach happened near the pre-reach timeout.
+        if (!hasReachedTarget && episodeSteps >= maxEpisodeSteps)
         {
             FinishEpisode(false);
             return;

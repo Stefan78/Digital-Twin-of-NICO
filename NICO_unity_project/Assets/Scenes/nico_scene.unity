@@ -1670,7 +1670,7 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   m_BrainParameters:
-    VectorObservationSize: 25
+    VectorObservationSize: 26
     NumStackedVectorObservations: 1
     m_ActionSpec:
       m_NumContinuousActions: 6
@@ -1679,9 +1679,9 @@ MonoBehaviour:
     VectorActionDescriptions: []
     VectorActionSpaceType: 1
     hasUpgradedBrainParametersWithActionSpec: 1
-  m_Model: {fileID: 5022602860645237092, guid: 165e7f8ea7fa0694593c966e47679512, type: 3}
+  m_Model: {fileID: 5022602860645237092, guid: a2c5e8ecb5321aa45b81e7be8a7907cf, type: 3}
   m_InferenceDevice: 0
-  m_BehaviorType: 2
+  m_BehaviorType: 0
   m_BehaviorName: NICO
   TeamId: 0
   m_UseChildSensors: 1
@@ -1769,7 +1769,7 @@ MonoBehaviour:
     fixedTargetAngle: 35
   target: {fileID: 3528808699769795005}
   rightHandEffector: {fileID: 7825258367879755156}
-  targetSpawnVolume: {fileID: 0}
+  targetSpawnVolume: {fileID: 1454646300}
   spawnBoundaryMarginLocal: 0.005
   spawnPositionSeed: 12345
   curriculumRegionFractions:
@@ -1779,9 +1779,12 @@ MonoBehaviour:
   - {x: 1, y: 1, z: 1}
   initialCurriculumStagesUnlocked: 1
   enableCurriculumProgression: 1
-  successWindowSize: 50
-  successRateToUnlockNextRegion: 0.8
+  successWindowSize: 1
+  successRateToUnlockNextRegion: 0.45
   maxEpisodeSteps: 1000
+  postReachSteps: 100
+  postReachDistancePenaltyWeight: 0.2
+  includePostReachPhaseObservation: 1
   reachDistance: 0.05
   progressWeight: 3
   distancePenaltyWeight: 0.02

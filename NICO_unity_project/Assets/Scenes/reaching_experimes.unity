@@ -507,8 +507,8 @@ Transform:
   m_GameObject: {fileID: 1454646300}
   serializedVersion: 2
   m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
-  m_LocalPosition: {x: 1.01, y: 0.5818, z: 0.153}
-  m_LocalScale: {x: 0.511077, y: 0.42589748, z: 0.77946657}
+  m_LocalPosition: {x: 1.072, y: 0.5818, z: 0.153}
+  m_LocalScale: {x: 0.3653797, y: 0.42589748, z: 0.42014325}
   m_ConstrainProportionsScale: 0
   m_Children: []
   m_Father: {fileID: 0}
@@ -8139,6 +8139,21 @@ MonoBehaviour:
   actionChangeMagnitude: 0.3
   noProgressStepsToEndEpisode: 100
   noProgressEpsilon: 0.001
+  evaluationPositionTolerance: 0.05
+  evaluationVelocityTolerance: 0.05
+  evaluationHoldSteps: 20
+  smoothnessDerivativeWindowSamples: 9
+  movementOnsetSpeedFraction: 0.05
+  movementOnsetConfirmationSamples: 3
+  sparcMaxCutoffFrequencyHz: 20
+  sparcAmplitudeThreshold: 0.05
+  enableFixedEvaluationMode: 0
+  fixedEvaluationEpisodeCount: 10
+  fixedEvaluationSeed: 12
+  fixedEvaluationRegionFraction: {x: 1, y: 1, z: 1}
+  fixedEvaluationRunLabel: checkpoint_10M
+  writeFixedEvaluationCsv: 1
+  forceDeterministicInference: 1
 --- !u!23 &8676569604244660560
 MeshRenderer:
   m_ObjectHideFlags: 0

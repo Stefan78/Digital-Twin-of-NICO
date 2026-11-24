@@ -5,8 +5,11 @@ EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
   m_Scenes:
-  - enabled: 1
+  - enabled: 0
     path: Assets/Scenes/reaching_baseline.unity
     guid: 6e1a0bd1d66299c41aefa63999ac666d
+  - enabled: 1
+    path: Assets/Scenes/reaching_experimes.unity
+    guid: a1dcd9df07d5b8741ba6d3ce69a3d0f7
   m_configObjects: {}
   m_UseUCBPForAssetBundles: 0

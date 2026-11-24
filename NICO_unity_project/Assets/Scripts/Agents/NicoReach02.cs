@@ -1,29 +1,20 @@
 using System;
 using System.Collections.Generic;
-using System.Linq;
+using System.Reflection;
 using UnityEngine;
 using Unity.MLAgents;
 using Unity.MLAgents.Actuators;
 using Unity.MLAgents.Sensors;
 
 /// <summary>
-/// Trains the NICO right hand to reach one physical target cube.
+/// Main ML-Agents component for training the NICO right hand to reach a target.
 ///
-/// The target cube is sampled uniformly inside a BoxCollider assigned as
-/// Target Spawn Volume. The spawn-volume collider may be disabled; its
-/// center and size are still used as geometric data.
+/// This class owns the Unity Inspector configuration and coordinates the helper
+/// modules. Joint control, target spawning, curriculum progression, and episode
+/// evaluation are implemented in separate ordinary C# classes.
 ///
-/// Curriculum stages are centered, progressively larger sub-regions of the
-/// full spawn volume. Each stage is unlocked after the configured recent
-/// success-rate threshold is reached. After first reaching the target, the NN
-/// can continue controlling the hand for a configurable post-reach interval.
-///
-/// Right-hand joints can be configured individually in the Inspector:
-/// - Fixed joints receive a drive target but are not NN actions.
-/// - Remaining joints are controlled by the neural network.
-/// - All joint positions and all joint accumulated-change values are observed,
-///   so the observation count stays constant when the fixed-joint selection changes.
-/// - The policy also observes whether it is in the post-reach holding phase.
+/// Keep this component on the same GameObject as the Agent's ArticulationBody.
+/// The helper classes are constructed automatically; they are not scene components.
 /// </summary>
 public class NicoAgentReach2 : Agent
 {
@@ -76,20 +67,12 @@ public class NicoAgentReach2 : Agent
     [Tooltip("Seed for the deterministic sequence of target positions. Same seed, spawn-volume geometry, and episode order reproduce the same sequence.")]
     [SerializeField] private int spawnPositionSeed = 12345;
 
-    private BoxCollider targetSpawnVolumeCollider;
-    private DeterministicRandom spawnPositionRandom;
-    private Vector3 validTargetPivotMinLocal;
-    private Vector3 validTargetPivotMaxLocal;
-    private Vector3 validTargetPivotCenterLocal;
-    private Vector3 validTargetPivotHalfRangeLocal;
-    private bool spawnVolumeGeometryReady;
-
     // ---------------------------------------------------------------------
     // AREA-BASED CURRICULUM
     // ---------------------------------------------------------------------
 
     [Header("Area-Based Curriculum")]
-    [Tooltip("Each entry defines the fraction of the FULL valid target-center range available at that curriculum stage, independently for X, Y and Z. Stages should grow or stay equal in every axis. Defaults: central 25%, 50%, 75%, then the full volume.")]
+    [Tooltip("Each entry defines the fraction of the FULL valid target-center range available at this curriculum stage, independently for X, Y and Z. Stages should grow or stay equal in every axis. Defaults: central 25%, 50%, 75%, then the full volume.")]
     [SerializeField]
     private List<Vector3> curriculumRegionFractions = new List<Vector3>
     {
@@ -111,9 +94,6 @@ public class NicoAgentReach2 : Agent
     [Tooltip("Unlock the next, larger spawn region when the recent success rate reaches this value.")]
     [SerializeField, Range(0f, 1f)] private float successRateToUnlockNextRegion = 0.8f;
 
-    private int unlockedCurriculumStageCount;
-    private readonly Queue<bool> recentEpisodeResults = new Queue<bool>();
-
     // ---------------------------------------------------------------------
     // EPISODE SETTINGS
     // ---------------------------------------------------------------------
@@ -121,7 +101,6 @@ public class NicoAgentReach2 : Agent
     [Header("Episode Length")]
     [Tooltip("Maximum number of Agent decisions allowed to reach the target. After reaching, the configured Post-Reach Steps are added as an extra continuation phase.")]
     [SerializeField, Min(1)] private int maxEpisodeSteps = 1000;
-    private int episodeSteps;
 
     // ---------------------------------------------------------------------
     // POST-REACH BEHAVIOUR
@@ -136,9 +115,6 @@ public class NicoAgentReach2 : Agent
 
     [Tooltip("Adds one observation: 0 while approaching and 1 during post-reach continuation. Recommended for new training (observation size increases by one). Disable only when testing a legacy model trained without this observation.")]
     [SerializeField] private bool includePostReachPhaseObservation = true;
-
-    private bool hasReachedTarget;
-    private int postReachStepsElapsed;
 
     // ---------------------------------------------------------------------
     // REWARD SETTINGS
@@ -172,62 +148,172 @@ public class NicoAgentReach2 : Agent
     [SerializeField, Min(0f)] private float noProgressEpsilon = 0.001f;
 
     // ---------------------------------------------------------------------
-    // RUNTIME JOINT DATA
+    // STABLE-HOLD EVALUATION (METRICS ONLY - DOES NOT AFFECT REWARDS)
     // ---------------------------------------------------------------------
 
-    private readonly List<ArticulationBody> nnControlledJoints = new List<ArticulationBody>();
-    private readonly Dictionary<ArticulationBody, float> defaultJointTargets =
-        new Dictionary<ArticulationBody, float>();
-    private readonly Dictionary<ArticulationBody, float> fixedJointTargets =
-        new Dictionary<ArticulationBody, float>();
-    private readonly Dictionary<ArticulationBody, float> currentJointChanges =
-        new Dictionary<ArticulationBody, float>();
-    private readonly Dictionary<ArticulationBody, ArticulationBody[]> continuationChains =
-        new Dictionary<ArticulationBody, ArticulationBody[]>();
+    [Header("Stable-Hold Evaluation (Metrics Only)")]
+    [Tooltip("Maximum end-effector-to-target distance for the independent stable-hold success metric, in Unity world units (normally meters). Suggested starting value: 0.05 m.")]
+    [SerializeField, Min(0f)] private float evaluationPositionTolerance = 0.05f;
 
+    [Tooltip("Maximum relative speed between the end effector and target for stable-hold success, in meters per second. Suggested starting value: 0.05 m/s.")]
+    [SerializeField, Min(0f)] private float evaluationVelocityTolerance = 0.05f;
+
+    [Tooltip("Number of consecutive Agent decisions for which both position and relative-speed tolerances must be satisfied. Suggested starting value: 20 decisions.")]
+    [SerializeField, Min(1)] private int evaluationHoldSteps = 20;
+
+    // ---------------------------------------------------------------------
+    // REACHING SMOOTHNESS EVALUATION (METRICS ONLY)
+    // ---------------------------------------------------------------------
+
+    [Header("Reaching Smoothness Evaluation (Metrics Only)")]
+    [Tooltip("Odd sample-window length for local-polynomial (Savitzky-Golay-style) velocity and jerk estimation. 9 samples is a practical starting point at 50 Hz. Must be at least 7 and will be rounded up to an odd number.")]
+    [SerializeField, Min(7)] private int smoothnessDerivativeWindowSamples = 9;
+
+    [Tooltip("Movement onset is detected when speed exceeds this fraction of the peak speed for the required consecutive samples. A short window before the detected onset is retained for derivative estimation.")]
+    [SerializeField, Range(0.01f, 0.25f)] private float movementOnsetSpeedFraction = 0.05f;
+
+    [Tooltip("Number of consecutive physics samples above the movement-onset speed threshold required to confirm that movement has started.")]
+    [SerializeField, Min(1)] private int movementOnsetConfirmationSamples = 3;
+
+    [Tooltip("SPARC maximum frequency cutoff in Hz. 20 Hz follows common published settings; it is automatically limited to the physics-sampling Nyquist frequency.")]
+    [SerializeField, Min(0.1f)] private float sparcMaxCutoffFrequencyHz = 20f;
+
+    [Tooltip("SPARC normalized spectrum amplitude threshold used to select its adaptive frequency cutoff. The commonly used published value is 0.05.")]
+    [SerializeField, Range(0.001f, 0.5f)] private float sparcAmplitudeThreshold = 0.05f;
+
+    // ---------------------------------------------------------------------
+    // FIXED-SET INFERENCE EVALUATION
+    // ---------------------------------------------------------------------
+
+    [Header("Fixed-Set Inference Evaluation (Post-Training Only)")]
+    [Tooltip("Enable only when evaluating a trained ONNX model. The Agent uses a deterministic, reproducible sequence of target positions, bypasses curriculum progression, writes per-episode CSV files, and stops after the requested number of episodes.")]
+    [SerializeField] private bool enableFixedEvaluationMode = false;
+
+    [Tooltip("Number of targets in the fixed evaluation set. Every checkpoint should use the same value and evaluation seed; the deterministic stratified set depends on both.")]
+    [SerializeField, Min(1)] private int fixedEvaluationEpisodeCount = 100;
+
+    [Tooltip("Seed for the fixed, stratified target set. Keep identical across all checkpoints to reproduce the same ordered target positions. Episode count must also remain identical.")]
+    [SerializeField] private int fixedEvaluationSeed = 314159;
+
+    [Tooltip("Fraction of the safe valid target-pivot range used for evaluation. (1,1,1) evaluates the complete valid spawn volume. Keep identical across checkpoints.")]
+    [SerializeField] private Vector3 fixedEvaluationRegionFraction = Vector3.one;
+
+    [Tooltip("Human-readable model/checkpoint label included in the CSV output, e.g. checkpoint_10M_seed1.")]
+    [SerializeField] private string fixedEvaluationRunLabel = "checkpoint_10M";
+
+    [Tooltip("Write one row per completed episode plus a summary CSV in the project-level NicoEvaluationResults folder.")]
+    [SerializeField] private bool writeFixedEvaluationCsv = true;
+
+    [Tooltip("When supported by the installed ML-Agents package, force deterministic continuous-action selection before the Agent policy is initialized.")]
+    [SerializeField] private bool forceDeterministicInference = true;
+
+    // ---------------------------------------------------------------------
+    // RUNTIME COORDINATORS
+    // ---------------------------------------------------------------------
+
+    private JointController jointController;
+    private TargetSpawnManager targetSpawnManager;
+    private CurriculumManager curriculumManager;
+    private StableHoldEvaluator stableHoldEvaluator;
+    private ReachingSmoothnessEvaluator reachingSmoothnessEvaluator;
+
+    private int episodeSteps;
+    private bool hasReachedTarget;
+    private int postReachStepsElapsed;
     private float previousDistance;
     private float bestDistance;
     private int noProgressSteps;
     private bool actionSizeWarningIssued;
 
-    /// <summary>
-    /// Small deterministic pseudo-random generator. It avoids depending on
-    /// UnityEngine.Random and makes the target-position sequence repeatable.
-    /// </summary>
-    private sealed class DeterministicRandom
+    private FixedEvaluationCsvLogger fixedEvaluationCsvLogger;
+    private List<Vector3> fixedEvaluationTargetPositions = new List<Vector3>();
+    private int fixedEvaluationEpisodesCompleted;
+    private Vector3 currentEvaluationTargetWorldPosition;
+    private float currentEvaluationInitialDistance;
+    private bool fixedEvaluationRunComplete;
+
+    // ---------------------------------------------------------------------
+    // UNITY / ML-AGENTS LIFECYCLE
+    // ---------------------------------------------------------------------
+
+    private void Awake()
     {
-        private uint state;
-
-        public DeterministicRandom(int seed)
-        {
-            state = unchecked((uint)seed);
-            if (state == 0u)
-                state = 0x6D2B79F5u;
-        }
-
-        private uint NextUInt()
-        {
-            uint value = state;
-            value ^= value << 13;
-            value ^= value >> 17;
-            value ^= value << 5;
-            state = value;
-            return value;
-        }
-
-        public float Range(float minInclusive, float maxExclusive)
-        {
-            if (maxExclusive <= minInclusive)
-                return minInclusive;
-
-            float unit = (NextUInt() >> 8) * (1f / 16777216f);
-            return minInclusive + (maxExclusive - minInclusive) * unit;
-        }
+        // BehaviorParameters hides its deterministic-inference flag in some
+        // ML-Agents versions. Set it before Agent.OnEnable/LazyInitialize creates
+        // the policy, using reflection to remain compatible across package versions.
+        if (enableFixedEvaluationMode && forceDeterministicInference)
+            TryEnableDeterministicInferenceBeforePolicyCreation();
     }
 
-    // ---------------------------------------------------------------------
-    // INITIALIZATION
-    // ---------------------------------------------------------------------
+    private void TryEnableDeterministicInferenceBeforePolicyCreation()
+    {
+        Component behaviorParameters = null;
+        Component[] components = GetComponents<Component>();
+        foreach (Component component in components)
+        {
+            if (component != null && component.GetType().Name == "BehaviorParameters")
+            {
+                behaviorParameters = component;
+                break;
+            }
+        }
+
+        if (behaviorParameters == null)
+        {
+            Debug.LogWarning("[NicoEvaluation] Behavior Parameters component not found. Deterministic inference could not be configured automatically.");
+            return;
+        }
+
+        const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+        System.Type componentType = behaviorParameters.GetType();
+
+        try
+        {
+            PropertyInfo modelProperty = componentType.GetProperty("Model", flags);
+            if (modelProperty != null && modelProperty.GetValue(behaviorParameters, null) == null)
+            {
+                Debug.LogError("[NicoEvaluation] Behavior Parameters has no ONNX Model assigned. Assign the trained model before evaluation.");
+            }
+
+            PropertyInfo behaviorTypeProperty = componentType.GetProperty("BehaviorType", flags);
+            if (behaviorTypeProperty != null)
+            {
+                object behaviorType = behaviorTypeProperty.GetValue(behaviorParameters, null);
+                if (behaviorType != null && !string.Equals(behaviorType.ToString(), "InferenceOnly", StringComparison.OrdinalIgnoreCase))
+                {
+                    Debug.LogWarning(
+                        "[NicoEvaluation] Behavior Type is '" + behaviorType + "'. Set it to 'Inference Only' for a post-training benchmark.");
+                }
+            }
+
+            PropertyInfo deterministicProperty = componentType.GetProperty("DeterministicInference", flags);
+            if (deterministicProperty != null &&
+                deterministicProperty.PropertyType == typeof(bool) &&
+                deterministicProperty.CanWrite)
+            {
+                deterministicProperty.SetValue(behaviorParameters, true, null);
+                Debug.Log("[NicoEvaluation] Deterministic inference enabled through BehaviorParameters.DeterministicInference.");
+                return;
+            }
+
+            FieldInfo deterministicField = componentType.GetField("m_DeterministicInference", flags);
+            if (deterministicField != null && deterministicField.FieldType == typeof(bool))
+            {
+                deterministicField.SetValue(behaviorParameters, true);
+                Debug.Log("[NicoEvaluation] Deterministic inference enabled through the serialized BehaviorParameters field.");
+                return;
+            }
+        }
+        catch (System.Exception exception)
+        {
+            Debug.LogWarning("[NicoEvaluation] Could not set deterministic inference automatically: " + exception.Message);
+            return;
+        }
+
+        Debug.LogWarning(
+            "[NicoEvaluation] This installed ML-Agents version does not expose a recognized deterministic-inference setting. " +
+            "The evaluation target sequence is still deterministic, but action selection may not be. Check your ML-Agents version.");
+    }
 
     public override void Initialize()
     {
@@ -254,15 +340,37 @@ public class NicoAgentReach2 : Agent
             return;
         }
 
-        if (!InitializeSpawnVolume())
+        targetSpawnManager = new TargetSpawnManager();
+        int effectiveSpawnSeed = enableFixedEvaluationMode ? fixedEvaluationSeed : spawnPositionSeed;
+        if (!targetSpawnManager.Initialize(target, targetSpawnVolume, spawnBoundaryMarginLocal, effectiveSpawnSeed))
         {
             enabled = false;
             return;
         }
 
-        ValidateCurriculumStages();
+        if (curriculumRegionFractions == null)
+            curriculumRegionFractions = new List<Vector3>();
 
-        PrepareRightHandJointList();
+        curriculumManager = new CurriculumManager();
+        curriculumManager.Initialize(curriculumRegionFractions, initialCurriculumStagesUnlocked);
+
+        jointController = new JointController();
+        if (!jointController.Initialize(
+                transform,
+                autoDetectRightHandJoints,
+                rightHandJoints,
+                jointControlSettings,
+                out string jointConfigurationError))
+        {
+            Debug.LogError(jointConfigurationError);
+            enabled = false;
+            return;
+        }
+
+        // Keep the Inspector list synchronized with the detected/cleaned list,
+        // matching the original auto-detection behaviour.
+        rightHandJoints = jointController.RightHandJoints;
+
         if (rightHandJoints.Count == 0)
         {
             Debug.LogError("NicoAgentReach: no right-hand joints were found or assigned. Check the joint list or the r_ naming convention.");
@@ -270,517 +378,70 @@ public class NicoAgentReach2 : Agent
             return;
         }
 
-        CacheContinuationChains();
-        PrepareFixedAndNNJointLists();
-        if (!enabled)
-            return;
-
-        if (nnControlledJoints.Count == 0)
+        if (jointController.NNControlledJoints.Count == 0)
         {
             Debug.LogError("NicoAgentReach: all right-hand joints are marked fixed. At least one joint must remain NN-controlled.");
             enabled = false;
             return;
         }
 
-        spawnPositionRandom = new DeterministicRandom(spawnPositionSeed);
-        unlockedCurriculumStageCount = Mathf.Clamp(
-            initialCurriculumStagesUnlocked, 1, curriculumRegionFractions.Count);
+        stableHoldEvaluator = new StableHoldEvaluator(
+            rightHandEffector,
+            target,
+            evaluationPositionTolerance,
+            evaluationVelocityTolerance,
+            evaluationHoldSteps);
 
-        foreach (ArticulationBody joint in nnControlledJoints)
+        reachingSmoothnessEvaluator = new ReachingSmoothnessEvaluator(
+            smoothnessDerivativeWindowSamples,
+            movementOnsetSpeedFraction,
+            movementOnsetConfirmationSamples,
+            sparcMaxCutoffFrequencyHz,
+            sparcAmplitudeThreshold);
+
+        fixedEvaluationEpisodesCompleted = 0;
+        fixedEvaluationRunComplete = false;
+        if (enableFixedEvaluationMode)
         {
-            defaultJointTargets[joint] = joint.xDrive.target;
-            currentJointChanges[joint] = 0f;
+            fixedEvaluationRegionFraction = new Vector3(
+                Mathf.Clamp01(fixedEvaluationRegionFraction.x),
+                Mathf.Clamp01(fixedEvaluationRegionFraction.y),
+                Mathf.Clamp01(fixedEvaluationRegionFraction.z));
+
+            fixedEvaluationTargetPositions = targetSpawnManager.GenerateStratifiedTargetSet(
+                fixedEvaluationRegionFraction,
+                Mathf.Max(1, fixedEvaluationEpisodeCount),
+                fixedEvaluationSeed);
+
+            if (writeFixedEvaluationCsv)
+            {
+                fixedEvaluationCsvLogger = new FixedEvaluationCsvLogger(
+                    fixedEvaluationRunLabel,
+                    fixedEvaluationSeed,
+                    Mathf.Max(1, fixedEvaluationEpisodeCount));
+            }
+
+            Debug.Log(
+                "[NicoEvaluation] FIXED EVALUATION MODE enabled. " +
+                $"Episodes={Mathf.Max(1, fixedEvaluationEpisodeCount)}, seed={fixedEvaluationSeed}, " +
+                $"region fraction={fixedEvaluationRegionFraction}, target-set sampler=deterministic stratified sequence. " +
+                "Curriculum progression is bypassed. Keep spawn-volume geometry and all reset settings identical across checkpoints.");
         }
 
         LogJointConfiguration();
         LogSpawnVolumeConfiguration();
     }
 
-    private bool InitializeSpawnVolume()
+    private void FixedUpdate()
     {
-        if (targetSpawnVolume == null)
+        if (reachingSmoothnessEvaluator != null && rightHandEffector != null)
         {
-            Debug.LogError("NicoAgentReach: assign the TargetSpawnVolume cube GameObject in the Inspector.");
-            return false;
-        }
-
-        if (targetSpawnVolume == target)
-        {
-            Debug.LogError("NicoAgentReach: Target and Target Spawn Volume must be two different GameObjects.");
-            return false;
-        }
-
-        if (targetSpawnVolume.transform.IsChildOf(target.transform))
-        {
-            Debug.LogError(
-                "NicoAgentReach: TargetSpawnVolume cannot be a child of the moving Target object, " +
-                "because it would move whenever the target is repositioned.");
-            return false;
-        }
-
-        targetSpawnVolumeCollider = targetSpawnVolume.GetComponent<BoxCollider>();
-        if (targetSpawnVolumeCollider == null)
-        {
-            Debug.LogError("NicoAgentReach: TargetSpawnVolume must have a BoxCollider on the same GameObject.");
-            return false;
-        }
-
-        if (targetSpawnVolumeCollider.size.x <= 0f ||
-            targetSpawnVolumeCollider.size.y <= 0f ||
-            targetSpawnVolumeCollider.size.z <= 0f)
-        {
-            Debug.LogError("NicoAgentReach: TargetSpawnVolume BoxCollider must have positive size on all axes.");
-            return false;
-        }
-
-        CacheTargetColliderOffsetsAndCalculateValidRange();
-
-        if (validTargetPivotMinLocal.x > validTargetPivotMaxLocal.x ||
-            validTargetPivotMinLocal.y > validTargetPivotMaxLocal.y ||
-            validTargetPivotMinLocal.z > validTargetPivotMaxLocal.z)
-        {
-            Debug.LogError(
-                "NicoAgentReach: the target cube is too large to fit inside TargetSpawnVolume " +
-                "with the current Spawn Boundary Margin. Enlarge the volume or reduce the margin.");
-            return false;
-        }
-
-        spawnVolumeGeometryReady = true;
-        return true;
-    }
-
-    private void CacheTargetColliderOffsetsAndCalculateValidRange()
-    {
-        Vector3 offsetMin = Vector3.zero;
-        Vector3 offsetMax = Vector3.zero;
-        bool foundAnyBounds = false;
-
-        Collider[] colliders = target.GetComponentsInChildren<Collider>(true);
-
-        foreach (Collider targetCollider in colliders)
-        {
-            if (targetCollider == null)
-                continue;
-
-            BoxCollider box = targetCollider as BoxCollider;
-            if (box != null)
-            {
-                Vector3 half = box.size * 0.5f;
-
-                for (int corner = 0; corner < 8; corner++)
-                {
-                    Vector3 sign = new Vector3(
-                        (corner & 1) == 0 ? -1f : 1f,
-                        (corner & 2) == 0 ? -1f : 1f,
-                        (corner & 4) == 0 ? -1f : 1f);
-
-                    Vector3 pointInBoxLocal = box.center + Vector3.Scale(half, sign);
-                    Vector3 pointWorld = box.transform.TransformPoint(pointInBoxLocal);
-                    Vector3 offsetInSpawnLocal = targetSpawnVolume.transform.InverseTransformVector(
-                        pointWorld - target.transform.position);
-
-                    EncapsulateOffset(offsetInSpawnLocal, ref offsetMin, ref offsetMax, ref foundAnyBounds);
-                }
-            }
-            else if (targetCollider.enabled)
-            {
-                // Conservative fallback for non-box collider shapes: use their world AABB corners.
-                AddWorldBoundsCorners(targetCollider.bounds, ref offsetMin, ref offsetMax, ref foundAnyBounds);
-            }
-        }
-
-        // If the target has no Collider components, use its Renderer bounds so the visible
-        // target still fits inside the volume. This is a conservative world-AABB approximation.
-        if (!foundAnyBounds)
-        {
-            Renderer[] renderers = target.GetComponentsInChildren<Renderer>(true);
-            foreach (Renderer targetRenderer in renderers)
-            {
-                if (targetRenderer != null && targetRenderer.enabled)
-                    AddWorldBoundsCorners(targetRenderer.bounds, ref offsetMin, ref offsetMax, ref foundAnyBounds);
-            }
-        }
-
-        if (!foundAnyBounds)
-        {
-            offsetMin = Vector3.zero;
-            offsetMax = Vector3.zero;
-            Debug.LogWarning(
-                "NicoAgentReach: no enabled target Collider or Renderer bounds were found. " +
-                "The target pivot alone will be constrained to the spawn volume.");
-        }
-
-        Vector3 volumeMin = targetSpawnVolumeCollider.center - targetSpawnVolumeCollider.size * 0.5f;
-        Vector3 volumeMax = targetSpawnVolumeCollider.center + targetSpawnVolumeCollider.size * 0.5f;
-
-        Vector3 margin = Vector3.one * spawnBoundaryMarginLocal;
-        volumeMin += margin;
-        volumeMax -= margin;
-
-        // A target pivot is valid only if every target-collider corner remains inside the volume.
-        validTargetPivotMinLocal = volumeMin - offsetMin;
-        validTargetPivotMaxLocal = volumeMax - offsetMax;
-        validTargetPivotCenterLocal = (validTargetPivotMinLocal + validTargetPivotMaxLocal) * 0.5f;
-        validTargetPivotHalfRangeLocal = (validTargetPivotMaxLocal - validTargetPivotMinLocal) * 0.5f;
-    }
-
-    private void AddWorldBoundsCorners(
-        Bounds worldBounds,
-        ref Vector3 offsetMin,
-        ref Vector3 offsetMax,
-        ref bool foundAnyBounds)
-    {
-        Vector3 half = worldBounds.extents;
-
-        for (int corner = 0; corner < 8; corner++)
-        {
-            Vector3 sign = new Vector3(
-                (corner & 1) == 0 ? -1f : 1f,
-                (corner & 2) == 0 ? -1f : 1f,
-                (corner & 4) == 0 ? -1f : 1f);
-
-            Vector3 pointWorld = worldBounds.center + Vector3.Scale(half, sign);
-            Vector3 offsetInSpawnLocal = targetSpawnVolume.transform.InverseTransformVector(
-                pointWorld - target.transform.position);
-
-            EncapsulateOffset(offsetInSpawnLocal, ref offsetMin, ref offsetMax, ref foundAnyBounds);
+            reachingSmoothnessEvaluator.SamplePhysicsStep(
+                rightHandEffector.transform.position,
+                Time.fixedTime,
+                Time.fixedDeltaTime);
         }
     }
-
-    private static void EncapsulateOffset(
-        Vector3 offset,
-        ref Vector3 offsetMin,
-        ref Vector3 offsetMax,
-        ref bool initialized)
-    {
-        if (!initialized)
-        {
-            offsetMin = offset;
-            offsetMax = offset;
-            initialized = true;
-            return;
-        }
-
-        offsetMin = Vector3.Min(offsetMin, offset);
-        offsetMax = Vector3.Max(offsetMax, offset);
-    }
-
-    private void ValidateCurriculumStages()
-    {
-        if (curriculumRegionFractions == null)
-            curriculumRegionFractions = new List<Vector3>();
-
-        if (curriculumRegionFractions.Count == 0)
-            curriculumRegionFractions.Add(Vector3.one);
-
-        Vector3 previous = Vector3.zero;
-
-        for (int i = 0; i < curriculumRegionFractions.Count; i++)
-        {
-            Vector3 requested = curriculumRegionFractions[i];
-            Vector3 stage = new Vector3(
-                Mathf.Clamp01(requested.x),
-                Mathf.Clamp01(requested.y),
-                Mathf.Clamp01(requested.z));
-
-            if (i > 0)
-            {
-                Vector3 expanded = new Vector3(
-                    Mathf.Max(stage.x, previous.x),
-                    Mathf.Max(stage.y, previous.y),
-                    Mathf.Max(stage.z, previous.z));
-
-                if (expanded != stage)
-                {
-                    Debug.LogWarning(
-                        $"NicoAgentReach: curriculum region {i + 1} was smaller than the previous stage " +
-                        "on at least one axis. It has been expanded to avoid curriculum regression.");
-                    stage = expanded;
-                }
-            }
-
-            curriculumRegionFractions[i] = stage;
-            previous = stage;
-        }
-    }
-
-    private void PrepareRightHandJointList()
-    {
-        if (autoDetectRightHandJoints)
-        {
-            rightHandJoints.Clear();
-            ArticulationBody[] allBodies = GetComponentsInChildren<ArticulationBody>(true);
-
-            foreach (ArticulationBody body in allBodies)
-            {
-                if (body == null)
-                    continue;
-
-                string jointName = body.name.ToLowerInvariant();
-                string jointTag = body.tag.ToLowerInvariant();
-
-                if (jointName.StartsWith("r_") && !jointTag.Contains("continuation"))
-                    rightHandJoints.Add(body);
-            }
-        }
-        else
-        {
-            rightHandJoints = rightHandJoints
-                .Where(joint => joint != null)
-                .Distinct()
-                .ToList();
-        }
-    }
-
-    private void CacheContinuationChains()
-    {
-        continuationChains.Clear();
-        HashSet<ArticulationBody> primaryJoints = new HashSet<ArticulationBody>(rightHandJoints);
-
-        foreach (ArticulationBody body in GetComponentsInChildren<ArticulationBody>(true))
-        {
-            if (body == null || !body.tag.ToLowerInvariant().Contains("base"))
-                continue;
-
-            ArticulationBody[] descendants = body.GetComponentsInChildren<ArticulationBody>(true)
-                .Where(child => child != body &&
-                                child.tag.ToLowerInvariant().Contains("continuation") &&
-                                !primaryJoints.Contains(child))
-                .ToArray();
-
-            if (descendants.Length > 0)
-                continuationChains[body] = descendants;
-        }
-    }
-
-    private void PrepareFixedAndNNJointLists()
-    {
-        fixedJointTargets.Clear();
-        nnControlledJoints.Clear();
-
-        HashSet<ArticulationBody> rightHandSet = new HashSet<ArticulationBody>(rightHandJoints);
-
-        foreach (JointControlSetting setting in jointControlSettings)
-        {
-            if (setting == null || !setting.isFixed)
-                continue;
-
-            if (setting.joint == null)
-            {
-                Debug.LogError("NicoAgentReach: a joint-control entry is marked Is Fixed but has no ArticulationBody assigned.");
-                enabled = false;
-                return;
-            }
-
-            if (!rightHandSet.Contains(setting.joint))
-            {
-                Debug.LogError(
-                    $"NicoAgentReach: fixed joint '{setting.joint.name}' is not in the Right Hand Joints list. " +
-                    "Add it to that list or check auto-detection (name must start with 'r_' and its tag must not contain 'continuation').");
-                enabled = false;
-                return;
-            }
-
-            if (fixedJointTargets.ContainsKey(setting.joint))
-            {
-                Debug.LogWarning($"NicoAgentReach: duplicate fixed-joint setting for '{setting.joint.name}'. The first value is kept.");
-                continue;
-            }
-
-            ArticulationDrive drive = setting.joint.xDrive;
-            float clampedTarget = Mathf.Clamp(setting.fixedTargetAngle, drive.lowerLimit, drive.upperLimit);
-
-            if (!Mathf.Approximately(clampedTarget, setting.fixedTargetAngle))
-            {
-                Debug.LogWarning(
-                    $"NicoAgentReach: fixed target for '{setting.joint.name}' was clamped from " +
-                    $"{setting.fixedTargetAngle} to {clampedTarget} because of its drive limits.");
-            }
-
-            fixedJointTargets.Add(setting.joint, clampedTarget);
-        }
-
-        foreach (ArticulationBody joint in rightHandJoints)
-        {
-            if (joint != null && !fixedJointTargets.ContainsKey(joint))
-                nnControlledJoints.Add(joint);
-        }
-    }
-
-    private void LogJointConfiguration()
-    {
-        Debug.Log("[NicoAgentReach] Right-hand joint configuration:");
-
-        foreach (ArticulationBody joint in rightHandJoints)
-        {
-            if (fixedJointTargets.TryGetValue(joint, out float fixedTarget))
-                Debug.Log($"[NicoAgentReach] {joint.name}: FIXED drive target = {fixedTarget:F2}");
-            else
-            {
-                int actionIndex = nnControlledJoints.IndexOf(joint);
-                Debug.Log($"[NicoAgentReach] {joint.name}: NN continuous action = {actionIndex}");
-            }
-        }
-
-        int expectedObservations = rightHandJoints.Count * 2 + 3 +
-            (includePostReachPhaseObservation ? 1 : 0);
-        Debug.Log(
-            $"[NicoAgentReach] Right-hand joints: {rightHandJoints.Count}; " +
-            $"fixed: {fixedJointTargets.Count}; NN-controlled: {nnControlledJoints.Count}. " +
-            $"Expected Behavior Parameters: {expectedObservations} vector observations, " +
-            $"{nnControlledJoints.Count} continuous actions.");
-    }
-
-    private void LogSpawnVolumeConfiguration()
-    {
-        Debug.Log(
-            "[NicoAgentReach] TargetSpawnVolume ready. " +
-            $"Valid target-pivot range in volume-local coordinates: min={validTargetPivotMinLocal}, " +
-            $"max={validTargetPivotMaxLocal}. " +
-            $"Spawn volume BoxCollider enabled={targetSpawnVolumeCollider.enabled} (it may remain disabled).");
-
-        for (int i = 0; i < curriculumRegionFractions.Count; i++)
-        {
-            Debug.Log(
-                $"[NicoAgentReach] Curriculum region {i + 1}/{curriculumRegionFractions.Count}: " +
-                $"fraction={curriculumRegionFractions[i]}");
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // TARGET POSITION SAMPLING INSIDE THE SPAWN VOLUME
-    // ---------------------------------------------------------------------
-
-    private Vector3 GetCurrentCurriculumRegionFraction()
-    {
-        int stageIndex = Mathf.Clamp(
-            unlockedCurriculumStageCount - 1,
-            0,
-            curriculumRegionFractions.Count - 1);
-
-        return curriculumRegionFractions[stageIndex];
-    }
-
-    private Vector3 GenerateRandomTargetWorldPosition()
-    {
-        Vector3 fraction = GetCurrentCurriculumRegionFraction();
-        Vector3 regionHalfRange = Vector3.Scale(validTargetPivotHalfRangeLocal, fraction);
-
-        Vector3 localTargetPivot = validTargetPivotCenterLocal + new Vector3(
-            spawnPositionRandom.Range(-regionHalfRange.x, regionHalfRange.x),
-            spawnPositionRandom.Range(-regionHalfRange.y, regionHalfRange.y),
-            spawnPositionRandom.Range(-regionHalfRange.z, regionHalfRange.z));
-
-        return targetSpawnVolume.transform.TransformPoint(localTargetPivot);
-    }
-
-    // ---------------------------------------------------------------------
-    // JOINT DRIVE / RESET HELPERS
-    // ---------------------------------------------------------------------
-
-    private static void SetDriveTarget(ArticulationBody joint, float targetValue)
-    {
-        if (joint == null)
-            return;
-
-        ArticulationDrive drive = joint.xDrive;
-        drive.target = Mathf.Clamp(targetValue, drive.lowerLimit, drive.upperLimit);
-        joint.xDrive = drive;
-    }
-
-    /// <summary>
-    /// Applies the drive target to a primary joint and any tagged continuation
-    /// joints below it. Continuation joints are not separate NN actions.
-    /// </summary>
-    private void SetJointTarget(ArticulationBody joint, float targetValue)
-    {
-        SetDriveTarget(joint, targetValue);
-
-        if (continuationChains.TryGetValue(joint, out ArticulationBody[] chain))
-        {
-            foreach (ArticulationBody continuation in chain)
-            {
-                float ratio = continuation.tag.ToLowerInvariant().Contains("thumb") ? 0.25f : 1f;
-                SetDriveTarget(continuation, targetValue * ratio);
-            }
-        }
-    }
-
-    /// <summary>
-    /// Resets a joint at episode boundaries. Fixed joints are then maintained
-    /// by their articulation drives and are not overwritten every simulation step.
-    /// </summary>
-    private void ResetJointState(ArticulationBody joint, float targetValue)
-    {
-        if (joint == null)
-            return;
-
-        ResetOneJointState(joint, targetValue);
-
-        if (continuationChains.TryGetValue(joint, out ArticulationBody[] chain))
-        {
-            foreach (ArticulationBody continuation in chain)
-            {
-                float ratio = continuation.tag.ToLowerInvariant().Contains("thumb") ? 0.25f : 1f;
-                ResetOneJointState(continuation, targetValue * ratio);
-            }
-        }
-    }
-
-    private static void ResetOneJointState(ArticulationBody joint, float targetValue)
-    {
-        if (joint == null)
-            return;
-
-        SetDriveTarget(joint, targetValue);
-
-        if (joint.dofCount > 0)
-        {
-            // ArticulationDrive.target uses degrees for revolute joints,
-            // while ArticulationBody.jointPosition uses radians.
-            float reducedCoordinate = joint.jointType == ArticulationJointType.PrismaticJoint
-                ? targetValue
-                : targetValue * Mathf.Deg2Rad;
-
-            joint.jointPosition = new ArticulationReducedSpace(reducedCoordinate);
-        }
-
-        joint.jointVelocity = new ArticulationReducedSpace(0f);
-        joint.linearVelocity = Vector3.zero;
-        joint.angularVelocity = Vector3.zero;
-    }
-
-    /// <summary>
-    /// Returns the current physical joint coordinate in xDrive units:
-    /// degrees for revolute joints and meters for prismatic joints.
-    /// </summary>
-    private static float GetCurrentJointCoordinate(ArticulationBody joint)
-    {
-        if (joint == null || joint.dofCount == 0)
-            return 0f;
-
-        float coordinate = joint.jointPosition[0];
-        if (joint.jointType == ArticulationJointType.RevoluteJoint)
-            coordinate *= Mathf.Rad2Deg;
-
-        return coordinate;
-    }
-
-    private static float NormalizeJointCoordinate(ArticulationBody joint)
-    {
-        ArticulationDrive drive = joint.xDrive;
-        float range = drive.upperLimit - drive.lowerLimit;
-
-        if (Mathf.Abs(range) < 0.0001f)
-            return 0f;
-
-        float coordinate = GetCurrentJointCoordinate(joint);
-        return Mathf.Clamp01((coordinate - drive.lowerLimit) / range);
-    }
-
-    // ---------------------------------------------------------------------
-    // EPISODES / OBSERVATIONS / ACTIONS
-    // ---------------------------------------------------------------------
 
     public override void OnEpisodeBegin()
     {
@@ -790,20 +451,41 @@ public class NicoAgentReach2 : Agent
         hasReachedTarget = false;
         postReachStepsElapsed = 0;
 
-        // Sample a new target position uniformly inside the currently unlocked
-        // curriculum sub-cuboid. The one target GameObject is reused every episode.
-        target.transform.position = GenerateRandomTargetWorldPosition();
+        if (fixedEvaluationRunComplete)
+            return;
 
-        // Reset configured fixed joints to their requested starting pose.
-        foreach (KeyValuePair<ArticulationBody, float> fixedJoint in fixedJointTargets)
-            ResetJointState(fixedJoint.Key, fixedJoint.Value);
-
-        // Reset NN-controlled joints to the scene's initial drive targets.
-        foreach (ArticulationBody joint in nnControlledJoints)
+        // Training uses the currently unlocked curriculum region. Fixed evaluation
+        // bypasses curriculum and samples from the same full configured region on
+        // every run, using the evaluation-specific seed initialized above.
+        if (enableFixedEvaluationMode)
         {
-            ResetJointState(joint, defaultJointTargets[joint]);
-            currentJointChanges[joint] = 0f;
+            int targetIndex = Mathf.Clamp(
+                fixedEvaluationEpisodesCompleted,
+                0,
+                fixedEvaluationTargetPositions.Count - 1);
+            target.transform.position = fixedEvaluationTargetPositions[targetIndex];
         }
+        else
+        {
+            target.transform.position = targetSpawnManager.GenerateRandomTargetWorldPosition(
+                curriculumManager.CurrentRegionFraction);
+        }
+
+        // Reset configured fixed joints and NN-controlled joints to their episode poses.
+        jointController.ResetEpisodeJoints();
+
+        currentEvaluationTargetWorldPosition = target.transform.position;
+        currentEvaluationInitialDistance = Vector3.Distance(
+            rightHandEffector.transform.position,
+            target.transform.position);
+
+        // Initialize evaluation histories after all episode resets, so teleporting
+        // the hand into its starting pose is not counted as movement.
+        stableHoldEvaluator.Reset();
+        reachingSmoothnessEvaluator.Begin(
+            rightHandEffector.transform.position,
+            Time.fixedTime,
+            Time.fixedDeltaTime);
 
         previousDistance = Vector3.Distance(
             rightHandEffector.transform.position, target.transform.position);
@@ -814,15 +496,15 @@ public class NicoAgentReach2 : Agent
     {
         // 1. Observe the CURRENT PHYSICAL coordinate of every right-hand joint.
         // This includes fixed joints and makes physics-induced deviations observable.
-        foreach (ArticulationBody joint in rightHandJoints)
-            sensor.AddObservation(NormalizeJointCoordinate(joint));
+        foreach (ArticulationBody joint in jointController.RightHandJoints)
+            sensor.AddObservation(jointController.NormalizeJointCoordinate(joint));
 
         // 2. Observe accumulated action-change commands for ALL right-hand joints.
-        // Fixed joints have no NN command, so TryGetValue returns zero for them.
+        // Fixed joints have no NN command, so their accumulated change is zero.
         float changeScale = Mathf.Max(maxAccumulatedChange, 0.0001f);
-        foreach (ArticulationBody joint in rightHandJoints)
+        foreach (ArticulationBody joint in jointController.RightHandJoints)
         {
-            currentJointChanges.TryGetValue(joint, out float accumulatedChange);
+            jointController.CurrentJointChanges.TryGetValue(joint, out float accumulatedChange);
             sensor.AddObservation(Mathf.Clamp(accumulatedChange / changeScale, -1f, 1f));
         }
 
@@ -831,9 +513,6 @@ public class NicoAgentReach2 : Agent
             target.transform.position - rightHandEffector.transform.position);
 
         // 4. Optional phase indicator: 0 while approaching, 1 after first reaching.
-        // This lets the policy distinguish approach behaviour from post-reach holding,
-        // even if the hand temporarily drifts outside the reach radius. Disable only
-        // when the assigned legacy model expects the previous observation size.
         if (includePostReachPhaseObservation)
             sensor.AddObservation(hasReachedTarget ? 1f : 0f);
     }
@@ -843,44 +522,44 @@ public class NicoAgentReach2 : Agent
         episodeSteps++;
 
         int availableActions = actions.ContinuousActions.Length;
-        if (availableActions != nnControlledJoints.Count && !actionSizeWarningIssued)
+        if (availableActions != jointController.NNControlledJoints.Count && !actionSizeWarningIssued)
         {
             Debug.LogError(
                 $"NicoAgentReach: Behavior Parameters provides {availableActions} continuous actions, " +
-                $"but {nnControlledJoints.Count} joints are marked for NN control. Set Continuous Actions " +
-                $"to {nnControlledJoints.Count}.");
+                $"but {jointController.NNControlledJoints.Count} joints are marked for NN control. Set Continuous Actions " +
+                $"to {jointController.NNControlledJoints.Count}.");
             actionSizeWarningIssued = true;
         }
 
         float smoothnessSum = 0f;
         float movementSum = 0f;
         int controlledJointCount = 0;
-        int actionCount = Mathf.Min(availableActions, nnControlledJoints.Count);
+        int actionCount = Mathf.Min(availableActions, jointController.NNControlledJoints.Count);
 
         // The NN continues controlling every non-fixed joint both before and
         // after reaching the target. No joints are frozen in the post-reach phase.
         for (int i = 0; i < actionCount; i++)
         {
-            ArticulationBody joint = nnControlledJoints[i];
+            ArticulationBody joint = jointController.NNControlledJoints[i];
             float action = Mathf.Clamp(actions.ContinuousActions[i], -1f, 1f);
 
             // Incremental controller: NN output changes a bounded target-step command.
-            float previousChange = currentJointChanges[joint];
-            currentJointChanges[joint] = Mathf.Clamp(
+            float previousChange = jointController.CurrentJointChanges[joint];
+            jointController.CurrentJointChanges[joint] = Mathf.Clamp(
                 previousChange + action * actionChangeMagnitude,
                 -maxAccumulatedChange,
                 maxAccumulatedChange);
 
             float newTarget = Mathf.Clamp(
-                joint.xDrive.target + currentJointChanges[joint],
+                joint.xDrive.target + jointController.CurrentJointChanges[joint],
                 joint.xDrive.lowerLimit,
                 joint.xDrive.upperLimit);
 
-            SetJointTarget(joint, newTarget);
+            jointController.SetJointTarget(joint, newTarget);
 
             float normalizer = Mathf.Max(maxAccumulatedChange, 0.0001f);
-            smoothnessSum += Mathf.Abs(currentJointChanges[joint] - previousChange) / normalizer;
-            movementSum += Mathf.Abs(currentJointChanges[joint]) / normalizer;
+            smoothnessSum += Mathf.Abs(jointController.CurrentJointChanges[joint] - previousChange) / normalizer;
+            movementSum += Mathf.Abs(jointController.CurrentJointChanges[joint]) / normalizer;
             controlledJointCount++;
         }
 
@@ -890,6 +569,10 @@ public class NicoAgentReach2 : Agent
 
         float distance = Vector3.Distance(
             rightHandEffector.transform.position, target.transform.position);
+        float relativeSpeed = stableHoldEvaluator.CalculateRelativeEffectorSpeed();
+
+        // Independent evaluation. It never contributes to AddReward().
+        stableHoldEvaluator.Update(distance, relativeSpeed, episodeSteps);
 
         float progressReward = 0f;
         float proximityPenalty;
@@ -897,16 +580,20 @@ public class NicoAgentReach2 : Agent
 
         if (!hasReachedTarget)
         {
-            // Before the first successful reach, preserve the original progress
-            // shaping and ordinary proximity penalty.
             progressReward = progressWeight * (previousDistance - distance);
             proximityPenalty = -distancePenaltyWeight * distance;
 
             if (distance <= reachDistance)
             {
+                // Reaching smoothness ends at the first reach event. Stabilization
+                // is evaluated separately by StableHoldEvaluator.
+                reachingSmoothnessEvaluator.StopSampling(
+                    true,
+                    rightHandEffector.transform.position,
+                    Time.fixedTime);
                 hasReachedTarget = true;
                 postReachStepsElapsed = 0;
-                successReward = reachBonus; // Award only once, on first contact.
+                successReward = reachBonus;
 
                 Debug.Log(
                     $"[NicoAgentReach] Target reached. Continuing NN control for " +
@@ -915,14 +602,11 @@ public class NicoAgentReach2 : Agent
         }
         else
         {
-            // During the post-reach phase, stop rewarding incremental approach.
-            // Instead, penalize distance from the target on every decision while
-            // the NN remains fully active. Movement and smoothness penalties also
-            // continue, encouraging small/settled control commands.
             proximityPenalty = -postReachDistancePenaltyWeight * distance;
             postReachStepsElapsed++;
         }
 
+        // Reward calculation is unchanged by the evaluation modules.
         AddReward(
             progressReward + proximityPenalty + successReward +
             smoothnessPenalty + movementPenalty);
@@ -931,19 +615,14 @@ public class NicoAgentReach2 : Agent
 
         if (hasReachedTarget)
         {
-            // A zero value preserves immediate termination after reaching.
             if (postReachSteps <= 0)
             {
                 FinishEpisode(true);
                 return;
             }
 
-            // The target remains at the same sampled position. The hand continues
-            // receiving NN actions for the configured number of additional decisions.
             if (postReachStepsElapsed >= postReachSteps)
             {
-                // Count this episode as successful only if the hand is still within
-                // the reach tolerance when the post-reach phase finishes.
                 bool heldNearTarget = distance <= reachDistance;
                 FinishEpisode(heldNearTarget);
                 return;
@@ -951,8 +630,6 @@ public class NicoAgentReach2 : Agent
         }
         else
         {
-            // Stall detection applies only before the first successful reach.
-            // It must not interrupt the configured post-reach continuation phase.
             if (distance < bestDistance - noProgressEpsilon)
             {
                 bestDistance = distance;
@@ -971,8 +648,7 @@ public class NicoAgentReach2 : Agent
         }
 
         // maxEpisodeSteps is the maximum time allowed to reach the target.
-        // Once the target is reached, the full post-reach interval is allowed
-        // even if the reach happened near the pre-reach timeout.
+        // Once reached, the full post-reach interval is allowed even near timeout.
         if (!hasReachedTarget && episodeSteps >= maxEpisodeSteps)
         {
             FinishEpisode(false);
@@ -982,54 +658,134 @@ public class NicoAgentReach2 : Agent
 
     public override void Heuristic(in ActionBuffers actionsOut)
     {
-        // Neutral actions for Heuristic/manual mode. Training and inference use the policy.
         ActionSegment<float> continuousActions = actionsOut.ContinuousActions;
         for (int i = 0; i < continuousActions.Length; i++)
             continuousActions[i] = 0f;
     }
 
     // ---------------------------------------------------------------------
-    // AREA-BASED CURRICULUM PROGRESSION
+    // EPISODE COMPLETION AND REPORTING
     // ---------------------------------------------------------------------
 
-    private void FinishEpisode(bool success)
+    private void FinishEpisode(bool curriculumSuccess)
     {
-        RecordEpisodeResult(success);
+        // Stop an incomplete reaching trajectory without marking it as reached.
+        reachingSmoothnessEvaluator.StopSampling(
+            false,
+            rightHandEffector.transform.position,
+            Time.fixedTime);
+
+        ReachingSmoothnessMetrics smoothnessMetrics = reachingSmoothnessEvaluator.CalculateMetrics();
+        StableHoldMetrics stableHoldMetrics = stableHoldEvaluator.GetMetrics();
+        EvaluationMetricsReporter.ReportEpisode(stableHoldMetrics, smoothnessMetrics);
+
+        if (enableFixedEvaluationMode)
+        {
+            int episodeNumber = fixedEvaluationEpisodesCompleted + 1;
+            if (fixedEvaluationCsvLogger != null)
+            {
+                fixedEvaluationCsvLogger.WriteEpisode(
+                    episodeNumber,
+                    currentEvaluationTargetWorldPosition,
+                    currentEvaluationInitialDistance,
+                    episodeSteps,
+                    curriculumSuccess,
+                    GetCumulativeReward(),
+                    stableHoldMetrics,
+                    smoothnessMetrics,
+                    Time.fixedDeltaTime,
+                    Time.timeScale,
+                    evaluationPositionTolerance,
+                    evaluationVelocityTolerance,
+                    evaluationHoldSteps,
+                    reachDistance,
+                    postReachSteps,
+                    maxEpisodeSteps);
+            }
+
+            fixedEvaluationEpisodesCompleted++;
+            Debug.Log(
+                $"[NicoEvaluation] Completed episode {fixedEvaluationEpisodesCompleted}/" +
+                $"{Mathf.Max(1, fixedEvaluationEpisodeCount)}. " +
+                $"Stable-hold success={stableHoldMetrics.Success}, " +
+                $"Jerk valid={smoothnessMetrics.DimensionlessJerkValid}, " +
+                $"SPARC valid={smoothnessMetrics.SparcValid}.");
+
+            // Do not call EndEpisode on the final test. EndEpisode immediately
+            // invokes OnEpisodeBegin; disabling this Agent is the clean way to
+            // finish the finite benchmark without starting an extra episode.
+            if (fixedEvaluationEpisodesCompleted >= Mathf.Max(1, fixedEvaluationEpisodeCount))
+            {
+                fixedEvaluationRunComplete = true;
+                if (fixedEvaluationCsvLogger != null)
+                    fixedEvaluationCsvLogger.Complete(fixedEvaluationEpisodesCompleted);
+
+                Debug.Log(
+                    "[NicoEvaluation] Fixed evaluation completed. The Agent and its DecisionRequester are now disabled. " +
+                    "See the CSV paths reported above for per-episode results and distribution summaries.");
+                DecisionRequester decisionRequester = GetComponent<DecisionRequester>();
+                if (decisionRequester != null)
+                    decisionRequester.enabled = false;
+                enabled = false;
+                return;
+            }
+        }
+        else
+        {
+            // Preserve curriculum progression only during training mode.
+            curriculumManager.RecordEpisodeResult(
+                curriculumSuccess,
+                enableCurriculumProgression,
+                successWindowSize,
+                successRateToUnlockNextRegion);
+        }
+
         EndEpisode();
     }
 
-    private void RecordEpisodeResult(bool success)
+    // ---------------------------------------------------------------------
+    // DIAGNOSTIC LOGGING
+    // ---------------------------------------------------------------------
+
+    private void LogJointConfiguration()
     {
-        if (!enableCurriculumProgression)
-            return;
+        Debug.Log("[NicoAgentReach] Right-hand joint configuration:");
 
-        int windowSize = Mathf.Max(1, successWindowSize);
-
-        recentEpisodeResults.Enqueue(success);
-        while (recentEpisodeResults.Count > windowSize)
-            recentEpisodeResults.Dequeue();
-
-        if (recentEpisodeResults.Count < windowSize ||
-            unlockedCurriculumStageCount >= curriculumRegionFractions.Count)
-            return;
-
-        int successes = recentEpisodeResults.Count(result => result);
-        float successRate = successes / (float)recentEpisodeResults.Count;
-
-        if (successRate >= successRateToUnlockNextRegion)
+        foreach (ArticulationBody joint in jointController.RightHandJoints)
         {
-            int oldStageCount = unlockedCurriculumStageCount;
-            unlockedCurriculumStageCount = Mathf.Min(
-                unlockedCurriculumStageCount + 1,
-                curriculumRegionFractions.Count);
-            recentEpisodeResults.Clear();
+            if (jointController.TryGetFixedTarget(joint, out float fixedTarget))
+            {
+                Debug.Log($"[NicoAgentReach] {joint.name}: FIXED drive target = {fixedTarget:F2}");
+            }
+            else
+            {
+                int actionIndex = jointController.NNControlledJoints.IndexOf(joint);
+                Debug.Log($"[NicoAgentReach] {joint.name}: NN continuous action = {actionIndex}");
+            }
+        }
 
-            Vector3 newlyUnlockedFraction = curriculumRegionFractions[unlockedCurriculumStageCount - 1];
+        int expectedObservations = jointController.RightHandJoints.Count * 2 + 3 +
+            (includePostReachPhaseObservation ? 1 : 0);
+        Debug.Log(
+            $"[NicoAgentReach] Right-hand joints: {jointController.RightHandJoints.Count}; " +
+            $"fixed: {jointController.FixedJointCount}; NN-controlled: {jointController.NNControlledJoints.Count}. " +
+            $"Expected Behavior Parameters: {expectedObservations} vector observations, " +
+            $"{jointController.NNControlledJoints.Count} continuous actions.");
+    }
+
+    private void LogSpawnVolumeConfiguration()
+    {
+        Debug.Log(
+            "[NicoAgentReach] TargetSpawnVolume ready. " +
+            $"Valid target-pivot range in volume-local coordinates: min={targetSpawnManager.ValidTargetPivotMinLocal}, " +
+            $"max={targetSpawnManager.ValidTargetPivotMaxLocal}. " +
+            $"Spawn volume BoxCollider enabled={targetSpawnManager.SpawnVolumeCollider.enabled} (it may remain disabled).");
+
+        for (int i = 0; i < curriculumRegionFractions.Count; i++)
+        {
             Debug.Log(
-                $"[Reach Curriculum] Success rate {successRate:P0} over the last {windowSize} episodes. " +
-                $"Unlocked region {unlockedCurriculumStageCount}/{curriculumRegionFractions.Count} " +
-                $"(was {oldStageCount}/{curriculumRegionFractions.Count}); " +
-                $"region fraction={newlyUnlockedFraction}. ");
+                $"[NicoAgentReach] Curriculum region {i + 1}/{curriculumRegionFractions.Count}: " +
+                $"fraction={curriculumRegionFractions[i]}");
         }
     }
 
@@ -1048,28 +804,28 @@ public class NicoAgentReach2 : Agent
 
         Matrix4x4 previousMatrix = Gizmos.matrix;
         Color previousColor = Gizmos.color;
-
         Gizmos.matrix = targetSpawnVolume.transform.localToWorldMatrix;
 
-        // Full spawn volume.
         Gizmos.color = Color.cyan;
         Gizmos.DrawWireCube(volumeCollider.center, volumeCollider.size);
 
-        // Currently active curriculum sub-region. Once initialized, this outline
-        // uses the safe target-pivot range (it accounts for the target cube size).
         if (curriculumRegionFractions != null && curriculumRegionFractions.Count > 0)
         {
-            int stageIndex = Application.isPlaying
-                ? Mathf.Clamp(unlockedCurriculumStageCount - 1, 0, curriculumRegionFractions.Count - 1)
+            int stageIndex = Application.isPlaying && curriculumManager != null
+                ? Mathf.Clamp(curriculumManager.UnlockedStageCount - 1, 0, curriculumRegionFractions.Count - 1)
                 : 0;
 
             Vector3 fraction = curriculumRegionFractions[stageIndex];
             Gizmos.color = Color.yellow;
 
-            if (spawnVolumeGeometryReady)
+            if (targetSpawnManager != null && targetSpawnManager.SpawnVolumeGeometryReady)
             {
-                Vector3 regionHalfRange = Vector3.Scale(validTargetPivotHalfRangeLocal, fraction);
-                Gizmos.DrawWireCube(validTargetPivotCenterLocal, regionHalfRange * 2f);
+                Vector3 regionHalfRange = Vector3.Scale(
+                    targetSpawnManager.ValidTargetPivotHalfRangeLocal,
+                    fraction);
+                Gizmos.DrawWireCube(
+                    targetSpawnManager.ValidTargetPivotCenterLocal,
+                    regionHalfRange * 2f);
             }
             else
             {

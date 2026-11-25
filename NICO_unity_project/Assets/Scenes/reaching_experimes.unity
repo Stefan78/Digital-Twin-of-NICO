@@ -1679,7 +1679,7 @@ MonoBehaviour:
     VectorActionDescriptions: []
     VectorActionSpaceType: 1
     hasUpgradedBrainParametersWithActionSpec: 1
-  m_Model: {fileID: 5022602860645237092, guid: a2c5e8ecb5321aa45b81e7be8a7907cf, type: 3}
+  m_Model: {fileID: 5022602860645237092, guid: a79daf79e6541ba45ac1d12cdb6ffd2a, type: 3}
   m_InferenceDevice: 0
   m_BehaviorType: 0
   m_BehaviorName: NICO
@@ -8147,8 +8147,8 @@ MonoBehaviour:
   movementOnsetConfirmationSamples: 3
   sparcMaxCutoffFrequencyHz: 20
   sparcAmplitudeThreshold: 0.05
-  enableFixedEvaluationMode: 0
-  fixedEvaluationEpisodeCount: 10
+  enableFixedEvaluationMode: 1
+  fixedEvaluationEpisodeCount: 20
   fixedEvaluationSeed: 12
   fixedEvaluationRegionFraction: {x: 1, y: 1, z: 1}
   fixedEvaluationRunLabel: checkpoint_10M
